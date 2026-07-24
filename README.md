@@ -16,7 +16,16 @@ This repository packages an Azure DevOps plugin for GitHub Copilot CLI. It bring
 
 ## Installation
 
-The plugin includes its Azure DevOps canvas extension at `.github/extensions/azure-devops/extension.mjs`. GitHub Copilot CLI discovers project extensions from that directory when it opens a session in this repository.
+### GitHub Copilot App
+
+1. Open the Copilot App command palette and choose **Install extension**.
+2. Enter `https://github.com/microsoft/azure-devops-copilot-plugin/tree/main/.github/extensions/azure-devops`.
+3. Choose the **User** scope to make the plugin available in all of your projects, or choose the **Project** scope to add it only to the current repository.
+4. Open a Copilot session and select the **Azure DevOps** canvas when you need an interactive Azure DevOps view.
+
+### From this repository
+
+The plugin is included at `.github/extensions/azure-devops/extension.mjs`. GitHub Copilot CLI discovers project extensions from that directory when it opens a session in this repository.
 
 ## Requirements
 
