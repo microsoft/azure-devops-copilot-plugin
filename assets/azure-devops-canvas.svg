@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="480" viewBox="0 0 960 480" role="img" aria-labelledby="title description">
+  <title id="title">Azure DevOps Copilot Canvas</title>
+  <desc id="description">A diagram showing a Copilot canvas connected to Azure DevOps work items, repositories, and pull requests through AzureAuth.</desc>
+  <rect width="960" height="480" fill="#0d1117"/>
+  <rect x="56" y="86" width="260" height="308" rx="16" fill="#161b22" stroke="#58a6ff" stroke-width="2"/>
+  <text x="92" y="138" fill="#f0f6fc" font-family="Segoe UI, Arial, sans-serif" font-size="28" font-weight="600">Copilot Canvas</text>
+  <rect x="92" y="176" width="188" height="52" rx="8" fill="#1f6feb"/>
+  <text x="121" y="209" fill="#ffffff" font-family="Segoe UI, Arial, sans-serif" font-size="20">Azure DevOps</text>
+  <text x="92" y="274" fill="#8b949e" font-family="Segoe UI, Arial, sans-serif" font-size="18">Current branch PR</text>
+  <text x="92" y="310" fill="#8b949e" font-family="Segoe UI, Arial, sans-serif" font-size="18">Work item queries</text>
+  <text x="92" y="346" fill="#8b949e" font-family="Segoe UI, Arial, sans-serif" font-size="18">Repository browsing</text>
+  <path d="M352 240h128" stroke="#58a6ff" stroke-width="4"/>
+  <path d="m462 224 28 16-28 16" fill="none" stroke="#58a6ff" stroke-width="4"/>
+  <text x="365" y="212" fill="#8b949e" font-family="Segoe UI, Arial, sans-serif" font-size="16">AzureAuth</text>
+  <rect x="526" y="86" width="378" height="308" rx="16" fill="#161b22" stroke="#3fb950" stroke-width="2"/>
+  <text x="562" y="138" fill="#f0f6fc" font-family="Segoe UI, Arial, sans-serif" font-size="28" font-weight="600">Azure DevOps</text>
+  <rect x="562" y="176" width="306" height="52" rx="8" fill="#238636"/>
+  <text x="592" y="209" fill="#ffffff" font-family="Segoe UI, Arial, sans-serif" font-size="20">Work items</text>
+  <rect x="562" y="246" width="306" height="52" rx="8" fill="#238636"/>
+  <text x="592" y="279" fill="#ffffff" font-family="Segoe UI, Arial, sans-serif" font-size="20">Repositories</text>
+  <rect x="562" y="316" width="306" height="52" rx="8" fill="#238636"/>
+  <text x="592" y="349" fill="#ffffff" font-family="Segoe UI, Arial, sans-serif" font-size="20">Pull requests and artifacts</text>
+</svg>

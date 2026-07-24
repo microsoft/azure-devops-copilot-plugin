@@ -1,0 +1,11 @@
+name: Feature request
+description: Suggest an improvement to the Azure DevOps Copilot Canvas.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Your idea
+      description: Describe the workflow to improve and the outcome you expect.
+    validations:
+      required: true
