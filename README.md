@@ -1,6 +1,9 @@
-# Azure DevOps Copilot Canvas
+# Azure DevOps Copilot Plugin
 
-This repository packages an Azure DevOps canvas for GitHub Copilot CLI. The canvas detects the Azure DevOps remote for the current workspace and provides a local UI for work items, repositories, and pull requests.
+This repository packages an Azure DevOps plugin for GitHub Copilot CLI. It brings Azure DevOps context and workflows into Copilot, including remote detection, authentication, work-item queries, repository discovery, and pull-request operations.
+
+> [!WARNING]
+> This is a preview release. It is not supported for production workloads and may change without notice.
 
 ## Features
 
@@ -9,10 +12,11 @@ This repository packages an Azure DevOps canvas for GitHub Copilot CLI. The canv
 - Queries work items with WIQL and opens individual work items.
 - Lists repositories and finds the pull request for the current branch.
 - Creates pull requests and attaches Azure DevOps pull-request artifacts to work items.
+- Provides an Azure DevOps canvas as an interactive interface for these workflows.
 
 ## Installation
 
-The extension is included at `.github/extensions/azure-devops/extension.mjs`. GitHub Copilot CLI discovers project extensions from that directory when it opens a session in this repository.
+The plugin includes its Azure DevOps canvas extension at `.github/extensions/azure-devops/extension.mjs`. GitHub Copilot CLI discovers project extensions from that directory when it opens a session in this repository.
 
 ## Requirements
 
@@ -22,8 +26,8 @@ The extension is included at `.github/extensions/azure-devops/extension.mjs`. Gi
 
 ## Usage
 
-Open the **Azure DevOps** canvas from Copilot, then sign in with AzureAuth if prompted. The canvas reads its organization, project, and repository from the detected Git remote. The agent can also invoke the canvas actions for work-item queries, pull-request details, repository lists, and pull-request creation.
+Use the plugin's Azure DevOps capabilities from Copilot for remote-aware work-item, repository, and pull-request workflows. Open the **Azure DevOps** canvas when an interactive view is useful, then sign in with AzureAuth if prompted. The canvas reads its organization, project, and repository from the detected Git remote.
 
 ## Security
 
-The canvas keeps an AzureAuth access token only in process memory and does not write credentials to the repository.
+The plugin keeps an AzureAuth access token only in process memory and does not write credentials to the repository.
