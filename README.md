@@ -27,6 +27,10 @@ This repository packages an Azure DevOps plugin for GitHub Copilot CLI. It bring
 
 The plugin is included at `.github/extensions/azure-devops/extension.mjs`. GitHub Copilot CLI discovers project extensions from that directory when it opens a session in this repository.
 
+### Marketplace
+
+This repository is a single-plugin marketplace. Add `https://github.com/microsoft/azure-devops-copilot-plugin` as a Copilot marketplace, then select **Azure DevOps Copilot Plugin** from its catalog. The marketplace definition is stored in `.claude-plugin/marketplace.json`.
+
 ## Requirements
 
 - GitHub Copilot CLI with canvas support.

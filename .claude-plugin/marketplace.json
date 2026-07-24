@@ -1,0 +1,34 @@
+{
+  "name": "azure-devops-copilot-plugin-marketplace",
+  "metadata": {
+    "description": "Azure DevOps plugin marketplace for GitHub Copilot.",
+    "version": "0.1.0"
+  },
+  "owner": {
+    "name": "Microsoft",
+    "email": "copilot@github.com"
+  },
+  "plugins": [
+    {
+      "name": "azure-devops-copilot-plugin",
+      "source": "./",
+      "description": "Bring Azure DevOps work-item, repository, and pull-request workflows into GitHub Copilot.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Microsoft",
+        "url": "https://www.microsoft.com"
+      },
+      "homepage": "https://github.com/microsoft/azure-devops-copilot-plugin",
+      "repository": "https://github.com/microsoft/azure-devops-copilot-plugin",
+      "keywords": [
+        "azure-devops",
+        "ado",
+        "copilot",
+        "canvas",
+        "work-items",
+        "pull-requests"
+      ],
+      "license": "MIT"
+    }
+  ]
+}

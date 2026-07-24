@@ -5,6 +5,8 @@
   "author": {
     "name": "Microsoft"
   },
+  "homepage": "https://github.com/microsoft/azure-devops-copilot-plugin",
+  "license": "MIT",
   "repository": "https://github.com/microsoft/azure-devops-copilot-plugin",
   "keywords": [
     "azure-devops",
