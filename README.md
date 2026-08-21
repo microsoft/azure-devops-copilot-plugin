@@ -1,38 +1,24 @@
-# Azure DevOps Copilot Plugin
+# Azure DevOps Copilot Plugin [Preview]
 
-This repository packages an Azure DevOps plugin for GitHub Copilot CLI. It brings Azure DevOps context and workflows into Copilot, including remote detection, authentication, work-item queries, repository discovery, and pull-request operations.
+The Azure DevOps Copilot Plugin brings your Azure DevOps work into the Copilot App so you can review and act on it without leaving your Copilot session.
 
 > [!WARNING]
 > This is a preview release. It is not supported for production workloads and may change without notice.
 
 ## Features
 
-- Detects Azure DevOps Git remotes from the active workspace.
-- Uses AzureAuth to acquire Azure DevOps access tokens without storing them in the repository.
-- Queries work items with WIQL and opens individual work items.
-- Lists repositories and finds the pull request for the current branch.
-- Creates pull requests and attaches Azure DevOps pull-request artifacts to work items.
-- Provides an Azure DevOps canvas as an interactive interface for these workflows.
+- See **My Work** across Azure DevOps.
+- Browse and update work items.
+- Review and manage pull requests.
+- Connect pull requests and work items.
+- Work through an interactive Azure DevOps canvas in the Copilot App.
 
 ## Installation
 
 ### Marketplace
 
-This repository is a single-plugin marketplace. Add `https://github.com/microsoft/azure-devops-copilot-plugin` as a Copilot marketplace, then select **Azure DevOps Copilot Plugin** from its catalog. The marketplace definition is stored in `.claude-plugin/marketplace.json`.
-
-The plugin bundles its canvas at `extensions/azure-devops/extension.mjs`. Installing
-the plugin from the marketplace makes that extension available to Copilot sessions.
-
-## Requirements
-
-- GitHub Copilot CLI with canvas support.
-- Git configured with an Azure DevOps remote in the workspace that the canvas manages.
-- AzureAuth installed by the host environment. On Windows, the canvas searches `%LOCALAPPDATA%\Programs\AzureAuth`; on other platforms, it searches `~/.azureauth`.
+Add `https://github.com/microsoft/azure-devops-copilot-plugin` as a Copilot marketplace, then select **Azure DevOps Copilot Plugin** from its catalog.
 
 ## Usage
 
-Use the plugin's Azure DevOps capabilities from Copilot for remote-aware work-item, repository, and pull-request workflows. Open the **Azure DevOps** canvas when an interactive view is useful, then sign in with AzureAuth if prompted. The canvas reads its organization, project, and repository from the detected Git remote.
-
-## Security
-
-The plugin keeps an AzureAuth access token only in process memory and does not write credentials to the repository.
+Open the **Azure DevOps** canvas in the Copilot App to view My Work, work items, and pull requests for your Azure DevOps projects.

@@ -14,7 +14,10 @@ import {
     normalizeRichText,
     normalizeString,
 } from "./common.mjs";
-import { PULL_REQUEST_REVIEW_VOTING_ENABLED } from "./ui/feature-flags.mjs";
+import {
+    AGENCY_AUTH_ENABLED,
+    PULL_REQUEST_REVIEW_VOTING_ENABLED,
+} from "./ui/feature-flags.mjs";
 // The write policy lives under ui/ because the browser editor enforces it too, and
 // only files under that directory are served to the canvas. It is DOM-free so the
 // same module loads here.
@@ -459,6 +462,12 @@ function azureAuthDiscoveryTrace(discovery = managedAzureAuthDiscovery()) {
     };
 }
 
+function effectiveAgencyAuthDiscovery() {
+    return AGENCY_AUTH_ENABLED
+        ? azureAuthDiscoveryTrace()
+        : { roots: [], candidates: [], selected: "" };
+}
+
 function azureAuthExecutable(discovery = managedAzureAuthDiscovery()) {
     const managedExecutable = discovery.selected;
     if (!managedExecutable) {
@@ -553,6 +562,9 @@ function clearAgencyAuthMarker() {
 // endpoint used by interactive sign-in, so it can describe this real work without
 // flashing the sign-in chooser first.
 function startSilentAgencyAuth(entry) {
+    if (!AGENCY_AUTH_ENABLED) {
+        return null;
+    }
     const cache = azureAuthTokenCache;
     if (cache?.accessToken && (!cache.expiresAt || Number(cache.expiresAt) > Date.now())) {
         return null;
@@ -687,10 +699,18 @@ async function getAuthState() {
             authType: "microsoft",
             source: token.source,
             expiresAt: token.expiresAt,
-            azureAuthDiscovery: azureAuthDiscoveryTrace(),
+            azureAuthDiscovery: effectiveAgencyAuthDiscovery(),
         };
     } catch {
         // Fall through to an explicitly acquired AzureAuth token.
+    }
+    if (!AGENCY_AUTH_ENABLED) {
+        return {
+            isAuthenticated: false,
+            authType: "none",
+            source: "",
+            azureAuthDiscovery: effectiveAgencyAuthDiscovery(),
+        };
     }
     const cache = await readAzureAuthTokenCache();
     if (cache?.accessToken && (!cache.expiresAt || Number(cache.expiresAt) > Date.now())) {
@@ -699,14 +719,14 @@ async function getAuthState() {
             authType: "azureauth",
             source: cache.source || "azureauth",
             expiresAt: cache.expiresAt,
-            azureAuthDiscovery: azureAuthDiscoveryTrace(),
+            azureAuthDiscovery: effectiveAgencyAuthDiscovery(),
         };
     }
     return {
         isAuthenticated: false,
         authType: "none",
         source: "",
-        azureAuthDiscovery: azureAuthDiscoveryTrace(),
+        azureAuthDiscovery: effectiveAgencyAuthDiscovery(),
     };
 }
 
@@ -812,6 +832,12 @@ async function startMicrosoftAuth(entry) {
 }
 
 async function startAgencyAuth(entry) {
+    if (!AGENCY_AUTH_ENABLED) {
+        throw new CanvasError(
+            "azure_devops_auth_provider_unavailable",
+            "The selected sign-in provider is unavailable.",
+        );
+    }
     if (entry.authProcess?.status === "running") {
         return entry.authProcess;
     }
@@ -997,7 +1023,10 @@ async function makeAuthHeaders(extraHeaders = {}) {
     let token;
     try {
         token = await getBrowserOAuthAccessToken();
-    } catch {
+    } catch (error) {
+        if (!AGENCY_AUTH_ENABLED) {
+            throw error;
+        }
         token = await getAzureAuthAccessToken();
     }
     return {
@@ -4101,8 +4130,13 @@ async function handleApi(entry, req, res, url) {
         if (req.method === "POST" && url.pathname === "/api/auth/start") {
             const body = await readRequestBody(req);
             const provider = normalizeString(body.provider).toLowerCase();
-            if (provider !== "microsoft" && provider !== "agency") {
-                throw new CanvasError("azure_devops_invalid_auth_provider", "Select Microsoft or Agency sign-in.");
+            if (provider !== "microsoft" && (provider !== "agency" || !AGENCY_AUTH_ENABLED)) {
+                throw new CanvasError(
+                    "azure_devops_invalid_auth_provider",
+                    AGENCY_AUTH_ENABLED
+                        ? "Select Microsoft or Agency sign-in."
+                        : "Select Microsoft sign-in.",
+                );
             }
             jsonResponse(res, 200, {
                 authProcess: provider === "microsoft"
