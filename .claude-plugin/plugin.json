@@ -1,7 +1,7 @@
 {
   "name": "azure-devops-copilot-plugin",
   "description": "An Azure DevOps canvas for work items, repositories, and pull requests in GitHub Copilot CLI.",
-  "version": "0.1.36",
+  "version": "0.1.37",
   "author": {
     "name": "Microsoft"
   },
@@ -15,5 +15,10 @@
     "canvas",
     "work-items",
     "pull-requests"
-  ]
+  ],
+  "extensions": {
+    "com.github.copilot": {
+      "logo": "assets/preview.png"
+    }
+  }
 }
