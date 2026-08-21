@@ -2,6 +2,7 @@ import { renderPullRequest } from "./pull-request-view.mjs";
 import { renderWorkItem } from "./work-item-view.mjs";
 import { renderHome } from "./home-view.mjs";
 import { renderConnectionPanel } from "./connection-view.mjs";
+import { AGENCY_AUTH_ENABLED } from "./feature-flags.mjs";
 
 const warning = document.getElementById("setupWarning");
 const startupSplash = document.getElementById("startupSplash");
@@ -563,7 +564,8 @@ function showSignInSplash() {
     // a button whose only outcome is azure_devops_azureauth_not_found. The
     // button starts hidden in the markup, so an unreachable config leaves it
     // hidden rather than briefly advertising an option that cannot work.
-    signInAgencyButton.hidden = !currentConfig?.auth?.azureAuthDiscovery?.selected;
+    signInAgencyButton.hidden =
+        !AGENCY_AUTH_ENABLED || !currentConfig?.auth?.azureAuthDiscovery?.selected;
     startupSplash.hidden = true;
     startupSplash.setAttribute("aria-busy", "false");
     signInSplash.hidden = false;
@@ -1502,7 +1504,9 @@ connectionPanel.addEventListener("keydown", (event) => {
     }
 });
 signInMicrosoftButton.addEventListener("click", () => startAuth("microsoft"));
-signInAgencyButton.addEventListener("click", () => startAuth("agency"));
+if (AGENCY_AUTH_ENABLED) {
+    signInAgencyButton.addEventListener("click", () => startAuth("agency"));
+}
 signOutButton.addEventListener("click", signOut);
 // Middle-click closes a tab, matching the browser convention the tabs imitate.
 viewTabs.addEventListener("auxclick", (event) => {
