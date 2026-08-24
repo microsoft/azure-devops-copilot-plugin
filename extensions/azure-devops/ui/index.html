@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Azure DevOps</title>
+  <link rel="stylesheet" href="/ui/styles.css">
+</head>
+<body>
+  <main>
+    <section id="startupSplash" class="loading-surface" role="status" aria-live="polite" aria-busy="true">
+      <span class="loading-spinner loading-spinner-large" aria-hidden="true">
+        <svg class="loading-spinner-svg" viewBox="0 0 24 24">
+          <circle class="loading-spinner-track" cx="12" cy="12" r="9"></circle>
+          <circle class="loading-spinner-arc" cx="12" cy="12" r="9"></circle>
+        </svg>
+      </span>
+      <span class="loading-copy">
+        <strong id="startupTitle" class="loading-title">Preparing Azure DevOps</strong>
+        <span id="startupDetail" class="loading-detail">Checking your connection and sign-in.</span>
+      </span>
+    </section>
+    <section id="signInSplash" class="sign-in-splash" aria-live="polite" hidden>
+      <h1>Azure DevOps</h1>
+      <p>Sign in to view Azure DevOps work items and pull requests.</p>
+      <div class="sign-in-options">
+        <button id="signInMicrosoftButton" type="button">Microsoft (work, school, or personal account)</button>
+        <button id="signInAgencyButton" class="secondary" type="button" hidden>Agency (AzureAuth)</button>
+      </div>
+      <pre id="authOutput" class="auth-output" hidden></pre>
+    </section>
+    <div id="canvasContent" hidden>
+      <section id="setupWarning" class="notice" role="status" hidden></section>
+      <div class="view-bar">
+        <nav id="viewTabs" class="view-tabs" role="tablist" aria-label="Azure DevOps views" hidden></nav>
+      </div>
+      <section id="homePanel" role="tabpanel" aria-live="polite">
+        <div id="homeContent" class="home-sections"></div>
+      </section>
+      <div id="tabPanels"></div>
+      <section id="connectionPanel" class="connection-overlay" hidden role="dialog" aria-modal="true" tabindex="-1" aria-label="Azure DevOps connection"></section>
+    </div>
+  </main>
+  <footer>
+    <div class="footer-note">
+      <span>Azure DevOps</span><span>·</span><span id="versionLabel"></span><span>·</span>
+      <button id="refreshButton" class="footer-link" type="button">refresh</button><span>·</span>
+      <button id="connectionsButton" class="footer-link" type="button" aria-controls="connectionPanel" aria-expanded="false">connections</button><span>·</span>
+      <button id="signOutButton" class="footer-link" type="button">sign out</button><span>·</span>
+      <button id="showLogsButton" class="footer-link" type="button" aria-controls="logsPanel" aria-expanded="false">show logs</button><span>·</span>
+      <a class="footer-link" href="https://github.com/github/app/issues/new?title=%5BAzureDevOpsExtension%5D" target="_blank" rel="noopener noreferrer">feedback</a>
+    </div>
+  </footer>
+  <section id="logsPanel" class="logs-panel" hidden aria-label="Canvas logs">
+    <div class="logs-header"><strong>Logs</strong><button id="copyLogsButton" class="secondary" type="button">Copy logs</button><span id="copyLogsStatus" class="status" aria-live="polite"></span></div>
+    <div id="logsList" class="logs-list"></div>
+  </section>
+  <script type="module" src="/ui/app.mjs"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+{
+  "name": "azure-devops-copilot-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --experimental-vm-modules --test"
+  },
+  "devDependencies": {
+    "jsdom": "^29.1.1"
+  }
+}

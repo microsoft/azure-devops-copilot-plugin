@@ -1,0 +1,31 @@
+name: Bug report
+description: Report a problem with the Azure DevOps Copilot Canvas.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the behavior, what you expected, and steps to reproduce it.
+    validations:
+      required: true
+  - type: input
+    id: copilot-version
+    attributes:
+      label: GitHub Copilot CLI version
+      description: Run `copilot --version`.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system
+      description: Include the operating system and architecture.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Remove credentials, access tokens, and private URLs before attaching logs.
+      render: shell
