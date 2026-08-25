@@ -401,6 +401,9 @@ function renderThread(thread, options) {
                 try {
                     await options.onFixComment(thread.id, parentCommentId);
                     fix.querySelector("span").textContent = "Sent";
+                    controls
+                        .filter((control) => control !== fix)
+                        .forEach((control) => { control.disabled = false; });
                 } catch (error) {
                     message.textContent = error?.message || "Could not send the comment for fixing.";
                     message.hidden = false;

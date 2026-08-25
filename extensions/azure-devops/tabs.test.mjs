@@ -889,6 +889,8 @@ test("code comment threads use one file header and send the root comment for fix
     assert.deepEqual(state.fixRequests, [{ threadId: 1, commentId: 2 }]);
     assert.equal(fix.textContent, "Sent");
     assert.equal(fix.disabled, true);
+    assert.equal(window.document.querySelector(".comment-reply-button")?.disabled, false);
+    assert.equal(window.document.querySelector(".comment-status-button")?.disabled, false);
     assert.match(styles, /\.comment-header\s*\{[^}]*padding: var\(--base-size-4/);
     assert.match(styles, /\.comment-header\s*\{[^}]*align-items: center/);
     assert.match(styles, /\.comment-header\s*\{[^}]*background: var\(--background-color-muted/);

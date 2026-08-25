@@ -2,7 +2,7 @@
   "name": "azure-devops-copilot-plugin-marketplace",
   "metadata": {
     "description": "Azure DevOps plugin marketplace for GitHub Copilot.",
-    "version": "0.1.50"
+    "version": "0.1.51"
   },
   "owner": {
     "name": "Microsoft",
@@ -13,7 +13,7 @@
       "name": "azure-devops-copilot-plugin",
       "source": "./",
       "description": "Bring Azure DevOps work-item, repository, and pull-request workflows into GitHub Copilot.",
-      "version": "0.1.50",
+      "version": "0.1.51",
       "author": {
         "name": "Microsoft",
         "url": "https://www.microsoft.com"
