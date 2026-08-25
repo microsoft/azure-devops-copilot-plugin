@@ -107,8 +107,13 @@ section { border: 1px solid var(--border-color-default, #d0d7de); border-radius:
 .connection-field { display: grid; gap: 4px; }
 .connection-field-label { font-weight: var(--font-weight-semibold, 600); }
 .connection-field-hint { color: var(--text-color-muted, #57606a); font-size: var(--text-body-small, 12px); }
-.connection-input { box-sizing: border-box; width: 100%; border: 1px solid var(--border-color-default, #d0d7de); border-radius: 6px; padding: 6px 8px; color: inherit; background: var(--background-color-default, #fff); font: inherit; }
+.connection-combobox { position: relative; }
+.connection-combobox::after { position: absolute; top: 50%; right: 11px; width: 7px; height: 7px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; content: ""; pointer-events: none; transform: translateY(-70%) rotate(45deg); }
+.connection-input { box-sizing: border-box; width: 100%; border: 1px solid var(--border-color-default, #d0d7de); border-radius: 6px; padding: 6px 30px 6px 8px; color: inherit; background: var(--background-color-default, #fff); font: inherit; }
 .connection-input:disabled { opacity: .6; }
+.connection-options { position: absolute; z-index: 2; top: calc(100% + 4px); right: 0; left: 0; max-height: 240px; overflow: auto; border: 1px solid var(--border-color-default, #d0d7de); border-radius: 6px; padding: 4px; background: var(--background-color-overlay, var(--background-color-default, #fff)); box-shadow: 0 8px 24px rgba(0, 0, 0, .18); }
+.connection-option { border-radius: 4px; padding: 6px 8px; cursor: pointer; }
+.connection-option:hover, .connection-option.active { color: var(--text-color-accent, var(--text-color-default, #1f2328)); background: var(--background-color-accent-muted, rgba(9, 105, 218, .12)); }
 .connection-toggle { display: grid; grid-template-columns: auto 1fr; gap: 4px 8px; align-items: center; }
 .connection-toggle .connection-field-hint { grid-column: 2; }
 .connection-error { color: var(--fgColor-danger, #cf222e); font-size: var(--text-body-small, 12px); }

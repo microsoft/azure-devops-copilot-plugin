@@ -586,7 +586,7 @@ function startSilentAgencyAuth(entry) {
         provider: "azureauth",
         mode: "silent",
         status: "running",
-        output: "Authenticating with AzureAuth.",
+        output: "Signing in.",
         startedAt: new Date().toISOString(),
         completedAt: "",
     };
@@ -749,7 +749,7 @@ async function startMicrosoftAuth(entry) {
     const authProcess = {
         provider: "microsoft",
         status: "running",
-        output: "Complete Microsoft sign-in in the browser, then return to this canvas.",
+        output: "Complete sign-in in the browser, then return here.",
         startedAt: new Date().toISOString(),
         completedAt: "",
         redirectUri,
@@ -799,14 +799,14 @@ async function startMicrosoftAuth(entry) {
             if (generation !== authGeneration) {
                 clearTimeout(timeout);
                 res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-                res.end("<!doctype html><title>Signed out</title><p>This sign-in was abandoned because the canvas was signed out. You can close this window.</p>");
+                res.end("<!doctype html><title>Signed out</title><p>This sign-in was abandoned because the canvas was signed out. This window can be closed.</p>");
                 complete("failed", "Sign-in was abandoned because the canvas was signed out.");
                 return;
             }
             const cache = await writeBrowserTokenCache(tokenResult);
             clearTimeout(timeout);
             res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-            res.end("<!doctype html><title>Signed in</title><p>You are signed in to Azure DevOps. You can close this window.</p>");
+            res.end("<!doctype html><title>Signed in</title><p>Sign-in to Azure DevOps is complete. This window can be closed.</p>");
             complete("succeeded", "Signed in to Azure DevOps with Microsoft.", { expiresAt: cache.expiresAt });
         } catch (error) {
             clearTimeout(timeout);
@@ -847,7 +847,7 @@ async function startAgencyAuth(entry) {
     const authProcess = {
         provider: "azureauth",
         status: "running",
-        output: "Requesting an Azure DevOps token via AzureAuth. Complete any AzureAuth prompt, then return to this canvas.",
+        output: "Complete sign-in when prompted.",
         startedAt: new Date().toISOString(),
         completedAt: "",
         azureAuthDiscovery: azureAuthDiscoveryTrace(azureAuthDiscovery),
@@ -909,7 +909,7 @@ async function signOutAuth(entry) {
     const authProcess = {
         provider: "canvas",
         status: "succeeded",
-        output: "Cleared the canvas sign-in and saved connection state. AzureAuth sign-in state is managed outside this canvas.",
+        output: "Signed out.",
         startedAt: new Date().toISOString(),
         completedAt: new Date().toISOString(),
         clearedBrowserTokenCache,

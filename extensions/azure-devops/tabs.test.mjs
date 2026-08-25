@@ -362,8 +362,8 @@ test("silent AzureAuth has a truthful animated startup state without flashing si
         holdAuthStatus: auth.promise,
     });
 
-    assert.equal(window.document.getElementById("startupTitle").textContent, "Authenticating with AzureAuth");
-    assert.equal(window.document.getElementById("startupDetail").textContent, "Restoring your Azure DevOps sign-in.");
+    assert.equal(window.document.getElementById("startupTitle").textContent, "Signing in");
+    assert.equal(window.document.getElementById("startupDetail").textContent, "Restoring the Azure DevOps session.");
     assert.ok(window.document.querySelector("#startupSplash .loading-spinner-svg"));
     assert.equal(window.document.getElementById("signInSplash").hidden, true);
     assert.equal(window.document.getElementById("canvasContent").hidden, true);
@@ -404,6 +404,24 @@ test("failed silent AzureAuth ends at the sign-in chooser", describeDom, async (
     assert.equal(window.document.getElementById("signInSplash").hidden, false);
     assert.equal(window.document.getElementById("canvasContent").hidden, true);
     assert.equal(window.document.getElementById("signInAgencyButton").hidden, false);
+    assert.equal(
+        window.document.getElementById("signInAgencyButton").textContent,
+        "Agency (AzureAuth)",
+    );
+    assert.doesNotMatch(
+        window.document.getElementById("authOutput").textContent,
+        /canvas|azureauth|saved connection state/i,
+    );
+
+    window.document.getElementById("signInMicrosoftButton").click();
+    assert.equal(
+        window.document.getElementById("authOutput").textContent,
+        "Complete sign-in in the browser, then return here.",
+    );
+    assert.doesNotMatch(
+        window.document.getElementById("authOutput").textContent,
+        /provider|status|canvas|azureauth|saved connection state|\byou(?:r|'re)?\b/i,
+    );
 });
 
 test("Home starts as the visible, stable first tab", describeDom, async () => {
@@ -1464,7 +1482,9 @@ test("the picker only requires an organization, and says why a project still mat
     assert.deepEqual(labels, ["Organization", "Project", "Repository"]);
     assert.match(panel(window).textContent, /Required\./);
     assert.match(panel(window).textContent, /no organization-wide pull request list/);
-    const options = [...panel(window).querySelectorAll("datalist option")].map((el) => el.value);
+    const organization = panel(window).querySelector('[role="combobox"]');
+    organization.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+    const options = [...panel(window).querySelectorAll('[role="option"]')].map((el) => el.textContent);
     assert.ok(options.includes("contoso") && options.includes("fabrikam"), "known organizations are offered");
 });
 

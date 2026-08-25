@@ -553,8 +553,20 @@ function renderAuthOutput(process) {
         authOutput.textContent = "";
         return;
     }
+    let message = "Signing in...";
+    if (process.provider === "canvas" && process.status === "succeeded") {
+        message = "Signed out.";
+    } else if (process.status === "succeeded") {
+        message = "Signed in.";
+    } else if (process.status === "failed") {
+        message = "Sign-in didn't complete. Try again.";
+    } else if (process.provider === "microsoft") {
+        message = "Complete sign-in in the browser, then return here.";
+    } else if (process.provider === "azureauth") {
+        message = "Complete sign-in when prompted.";
+    }
     authOutput.hidden = false;
-    authOutput.textContent = `[${process.provider} · ${process.status}]\n${process.output || "Starting interactive sign-in..."}`;
+    authOutput.textContent = message;
     authOutput.scrollTop = authOutput.scrollHeight;
 }
 
@@ -613,7 +625,7 @@ async function finishSilentAuthentication(authProcess) {
     if (authProcess?.mode !== "silent") {
         return;
     }
-    showStartupLoading("Authenticating with AzureAuth", "Restoring your Azure DevOps sign-in.");
+    showStartupLoading("Signing in", "Restoring the Azure DevOps session.");
     const data = authProcess.status === "running"
         ? await waitForAuthentication(() => {}, SILENT_AUTH_POLL_LIMIT_MS)
         : await request("/api/auth/status");
@@ -667,7 +679,7 @@ async function signOut() {
     try {
         const data = await request("/api/auth/sign-out", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
         renderAuthOutput(data.authProcess);
-        addLog("trace", "Cleared canvas sign-in and saved connection state.");
+        addLog("trace", "Signed out and cleared local preferences.");
         resetTabs();
         await refresh();
     } catch (error) {
@@ -1392,7 +1404,7 @@ async function refresh() {
     }
     refreshButton.disabled = true;
     addLog("trace", "Refreshing canvas.");
-    showStartupLoading("Preparing Azure DevOps", "Checking your connection and sign-in.");
+    showStartupLoading("Preparing Azure DevOps", "Checking connection and sign-in.");
     try {
         const configResponse = await loadConfig();
         await finishSilentAuthentication(configResponse.authProcess);

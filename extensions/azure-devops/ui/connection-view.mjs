@@ -30,9 +30,9 @@ function sourceLabel(connection) {
     return "last used";
 }
 
-// Each field is "pick one you have, or type one we could not list". The list is
-// a convenience: a tenant that refuses the accounts API, or a user who knows the
-// name of a project the list did not return, still has a way through.
+// Each field is "pick one you have, or type one we could not list". A custom
+// combobox keeps that fallback while avoiding native datalist behavior, which
+// varies by browser and hides the other choices after an exact match is picked.
 //
 // The value is committed on both `input` and `change`. `input` alone leaves Save
 // disabled until the field is blurred, and a blur is exactly what clicking a
@@ -43,37 +43,112 @@ function sourceLabel(connection) {
 // fields, so what the user can see is what gets saved.
 function field(id, label, hint, { onInput, onCommit }) {
     const wrapper = element("label", "connection-field");
+    const control = element("div", "connection-combobox");
     const input = element("input", "connection-input");
     input.type = "text";
     input.setAttribute("autocomplete", "off");
     input.setAttribute("spellcheck", "false");
-    // A datalist is a sibling rather than a child: an input is a void element
-    // and cannot contain one.
-    const list = element("datalist");
+    input.setAttribute("role", "combobox");
+    input.setAttribute("aria-autocomplete", "list");
+    input.setAttribute("aria-expanded", "false");
+    input.setAttribute("aria-controls", id);
+    const list = element("div", "connection-options");
     list.id = id;
-    input.setAttribute("list", id);
+    list.setAttribute("role", "listbox");
+    list.hidden = true;
+    control.append(input, list);
     const hintNode = element("span", "connection-field-hint", hint);
-    wrapper.append(element("span", "connection-field-label", label), input, list, hintNode);
+    wrapper.append(element("span", "connection-field-label", label), control, hintNode);
 
-    input.addEventListener("input", () => onInput(input.value.trim()));
-    input.addEventListener("change", () => {
+    let values = [];
+    let visibleValues = [];
+    let activeIndex = -1;
+    let filtering = false;
+
+    const close = () => {
+        list.hidden = true;
+        activeIndex = -1;
+        input.setAttribute("aria-expanded", "false");
+        input.removeAttribute("aria-activedescendant");
+    };
+
+    const setActive = (index) => {
+        const options = [...list.querySelectorAll('[role="option"]')];
+        if (!options.length) {
+            activeIndex = -1;
+            input.removeAttribute("aria-activedescendant");
+            return;
+        }
+        activeIndex = (index + options.length) % options.length;
+        for (const [optionIndex, option] of options.entries()) {
+            option.setAttribute("aria-selected", String(optionIndex === activeIndex));
+            option.classList.toggle("active", optionIndex === activeIndex);
+        }
+        input.setAttribute("aria-activedescendant", options[activeIndex].id);
+        options[activeIndex].scrollIntoView?.({ block: "nearest" });
+    };
+
+    const choose = (value) => {
+        input.value = value;
+        onInput(value);
+        close();
+        onCommit?.(value);
+    };
+
+    const open = (filter) => {
+        filtering = filter;
+        const query = filter ? input.value.trim().toLocaleLowerCase() : "";
+        visibleValues = values.filter((value) => !query || value.toLocaleLowerCase().includes(query));
+        list.replaceChildren();
+        for (const [index, value] of visibleValues.entries()) {
+            const option = element("div", "connection-option", value);
+            option.id = `${id}-option-${index}`;
+            option.setAttribute("role", "option");
+            option.setAttribute("aria-selected", "false");
+            option.addEventListener("mousedown", (event) => {
+                event.preventDefault();
+                choose(value);
+            });
+            list.append(option);
+        }
+        list.hidden = !visibleValues.length;
+        input.setAttribute("aria-expanded", String(visibleValues.length > 0));
+        activeIndex = -1;
+        input.removeAttribute("aria-activedescendant");
+    };
+
+    input.addEventListener("input", () => {
         onInput(input.value.trim());
-        // Loading the dependent lists waits for the field to settle, so a name is
-        // not looked up once per keystroke.
-        if (onCommit) {
-            onCommit(input.value.trim());
+        open(true);
+    });
+    input.addEventListener("click", () => open(false));
+    input.addEventListener("keydown", (event) => {
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault();
+            if (list.hidden) open(false);
+            setActive(activeIndex + (event.key === "ArrowDown" ? 1 : -1));
+        } else if (event.key === "Enter" && !list.hidden && activeIndex >= 0) {
+            event.preventDefault();
+            choose(visibleValues[activeIndex]);
+        } else if (event.key === "Escape" && !list.hidden) {
+            event.preventDefault();
+            close();
         }
     });
-    return { wrapper, input, list, hintNode };
-}
-
-function setOptions(list, values) {
-    list.replaceChildren();
-    for (const value of values) {
-        const option = element("option");
-        option.value = value;
-        list.append(option);
-    }
+    input.addEventListener("blur", () => setTimeout(close, 0));
+    input.addEventListener("change", () => {
+        onInput(input.value.trim());
+        onCommit?.(input.value.trim());
+    });
+    return {
+        wrapper,
+        input,
+        hintNode,
+        setOptions(nextValues) {
+            values = [...nextValues];
+            if (!list.hidden) open(filtering);
+        },
+    };
 }
 
 export function renderConnectionPanel(container, state, handlers) {
@@ -191,9 +266,9 @@ export function renderConnectionPanel(container, state, handlers) {
         }
         pinInput.checked = Boolean(draft.isDefault);
 
-        setOptions(organization.list, organizations);
-        setOptions(project.list, projects);
-        setOptions(repository.list, repositories);
+        organization.setOptions(organizations);
+        project.setOptions(projects);
+        repository.setOptions(repositories);
         organization.hintNode.textContent = organizationsError
             ? `Could not list your organizations (${organizationsError}). Type the name instead.`
             : "Required.";
