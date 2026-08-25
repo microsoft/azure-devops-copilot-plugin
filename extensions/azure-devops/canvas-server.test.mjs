@@ -1367,14 +1367,26 @@ test("signing out clears the marker so the next load does not re-authenticate", 
         const status = await waitForAuthProcess(canvas);
         assert.equal(status.auth.isAuthenticated, true);
         assert.ok(existsSync(stubs.markerPath));
+        await authed(canvas, "/api/connection", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                organization: "fabrikam",
+                project: "widgets",
+                repositoryId: "widgets-api",
+            }),
+        });
+        assert.equal((await canvas.config2()).connections[0].repositoryId, "widgets-api");
 
         const signedOut = await canvas.signOut();
         assert.equal(signedOut.auth.isAuthenticated, false);
         assert.equal(existsSync(stubs.markerPath), false, "sign-out must clear the marker or the user cannot stay signed out");
+        assert.equal(signedOut.authProcess.clearedConnectionPreference, true);
 
         // A fresh load must now show the splash rather than silently signing back in.
         const reloaded = await canvas.config2();
         assert.equal(reloaded.auth.isAuthenticated, false, "sign-out must survive a reload");
+        assert.deepEqual(reloaded.connections, [], "sign-out must clear saved organization, project, and repository state");
     } finally {
         canvas.close();
     }

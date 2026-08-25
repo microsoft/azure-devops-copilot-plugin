@@ -660,11 +660,15 @@ async function startAuth(provider) {
 }
 
 async function signOut() {
+    if (!confirmDiscard(tabs)) {
+        return;
+    }
     signOutButton.disabled = true;
     try {
         const data = await request("/api/auth/sign-out", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
         renderAuthOutput(data.authProcess);
-        addLog("trace", "Cleared canvas sign-in state.");
+        addLog("trace", "Cleared canvas sign-in and saved connection state.");
+        resetTabs();
         await refresh();
     } catch (error) {
         addLog("error", "Failed to sign out.", error.message || "");

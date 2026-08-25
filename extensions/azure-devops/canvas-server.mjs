@@ -26,6 +26,7 @@ import {
     CONNECTION_SOURCE_REMOTE,
     CONNECTION_WRITE_FAILED,
     clearConnectionDefault,
+    clearConnectionPreference,
     normalizeConnection,
     readConnectionPreference,
     resolveConnections,
@@ -904,14 +905,16 @@ async function signOutAuth(entry) {
         clearBrowserTokenCache(),
         clearAzureAuthTokenCache(),
     ]);
+    const clearedConnectionPreference = savePreference(() => clearConnectionPreference());
     const authProcess = {
         provider: "canvas",
         status: "succeeded",
-        output: "Cleared the canvas sign-in state. AzureAuth sign-in state is managed outside this canvas.",
+        output: "Cleared the canvas sign-in and saved connection state. AzureAuth sign-in state is managed outside this canvas.",
         startedAt: new Date().toISOString(),
         completedAt: new Date().toISOString(),
         clearedBrowserTokenCache,
         clearedAzureAuthTokenCache,
+        clearedConnectionPreference,
     };
     entry.authProcess = authProcess;
 

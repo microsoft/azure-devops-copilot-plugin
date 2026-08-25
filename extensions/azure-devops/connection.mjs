@@ -16,7 +16,7 @@
 // same organization and project — which is the usual case, since pinning also
 // records the connection as the last one used. Returning only the default made
 // an explicit selection look like it had not been saved.
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { normalizeString } from "./common.mjs";
@@ -130,6 +130,19 @@ function persistOrFail(record) {
 export function clearConnectionDefault() {
     const record = readConnectionPreference();
     return persistOrFail({ default: null, lastUsed: record.lastUsed });
+}
+
+export function clearConnectionPreference() {
+    const path = connectionPreferencePath();
+    const existed = existsSync(path);
+    try {
+        rmSync(path, { force: true });
+        return existed;
+    } catch (error) {
+        const failure = new Error(`Could not clear the Azure DevOps connection: ${error?.message || "delete failed"}`);
+        failure.code = CONNECTION_WRITE_FAILED;
+        throw failure;
+    }
 }
 
 // The saved connections, most recently chosen first. Both are returned rather

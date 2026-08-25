@@ -146,6 +146,25 @@ test("clearing the default leaves the last used connection", async () => {
     assert.equal(record.lastUsed.organization, "fabrikam");
 });
 
+test("clearing the connection preference removes all saved connection state", async () => {
+    const { home, path } = withHome();
+    const {
+        writeConnectionPreference,
+        clearConnectionPreference,
+        readConnectionPreference,
+    } = await loadConnection(home);
+    writeConnectionPreference(
+        { organization: "fabrikam", project: "widgets", repositoryId: "widgets-api" },
+        { isDefault: true },
+    );
+
+    assert.equal(clearConnectionPreference(), true);
+    assert.equal(existsSync(path), false);
+    assert.equal(readConnectionPreference().default, null);
+    assert.equal(readConnectionPreference().lastUsed, null);
+    assert.equal(clearConnectionPreference(), false, "clearing an already empty preference is idempotent");
+});
+
 test("a missing or corrupt record reads as the first-run state rather than throwing", async () => {
     const { home, path } = withHome();
     const { readConnectionPreference } = await loadConnection(home);
