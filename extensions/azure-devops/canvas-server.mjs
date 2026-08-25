@@ -139,6 +139,9 @@ function parseAzureDevOpsRemoteUrl(remoteUrl) {
         if (url.hostname.toLowerCase().endsWith(".visualstudio.com")) {
             const organization = decodeURIComponent(url.hostname.slice(0, -".visualstudio.com".length));
             const segments = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+            if (segments[0]?.toLowerCase() === "defaultcollection") {
+                segments.shift();
+            }
             const gitIndex = segments.findIndex((segment) => segment.toLowerCase() === "_git");
             if (gitIndex >= 1 && segments[gitIndex + 1]) {
                 const project = segments[0];
@@ -4434,6 +4437,7 @@ export {
     listProjects,
     listRepositories,
     mapPullRequestThreads,
+    parseAzureDevOpsRemoteUrl,
     removePullRequestReviewer,
     replyToPullRequestComment,
     searchIdentities,

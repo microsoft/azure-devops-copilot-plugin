@@ -519,6 +519,35 @@ test("new session branch requests are sent to chat as a fixed prompt", async () 
     assert.equal(prompts[0].prompt, "Create a new branch for the current session.");
 });
 
+test("visualstudio.com remotes ignore the legacy DefaultCollection segment", async () => {
+    const stubs = discoveryStubs({ installed: false });
+    const { impl: execFileImpl } = execFileStub((done) => done(null, { stdout: "", stderr: "" }));
+    const namespace = await loadCanvasServer({ execFileImpl, ...stubs });
+
+    assert.deepEqual(
+        structuredClone(namespace.parseAzureDevOpsRemoteUrl(
+            "https://contoso.visualstudio.com/DefaultCollection/Widget%20Project/_git/sample-repo",
+        )),
+        {
+            organization: "contoso",
+            project: "Widget Project",
+            repository: "sample-repo",
+            url: "https://dev.azure.com/contoso/Widget%20Project/_git/sample-repo",
+        },
+    );
+    assert.deepEqual(
+        structuredClone(namespace.parseAzureDevOpsRemoteUrl(
+            "https://contoso.visualstudio.com/Widget%20Project/_git/sample-repo",
+        )),
+        {
+            organization: "contoso",
+            project: "Widget Project",
+            repository: "sample-repo",
+            url: "https://dev.azure.com/contoso/Widget%20Project/_git/sample-repo",
+        },
+    );
+});
+
 test("comment fix requests send a guarded prompt without requiring a specific integration", async () => {
     const stubs = discoveryStubs({ installed: false });
     const { impl: execFileImpl } = execFileStub((done) => done(null, { stdout: "", stderr: "" }));
