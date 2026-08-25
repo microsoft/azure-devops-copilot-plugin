@@ -799,7 +799,7 @@ test("the pull request header gives the merge summary a full row below title act
     assert.match(styles, /\.pr-merge-summary \{[^}]*grid-column: 1 \/ -1/);
 });
 
-test("code comment threads use one file header and a UI-only Fix action when active", describeDom, async () => {
+test("code comment threads use one file header and send the root comment for fixing", describeDom, async () => {
     const publishedDate = new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString();
     const authorImageUrl = "https://dev.azure.com/example/_api/_common/identityImage?id=123";
     const { window, state } = await boot({
@@ -886,8 +886,9 @@ test("code comment threads use one file header and a UI-only Fix action when act
     assert.equal(fixIcon?.querySelectorAll("path").length, 2);
     fix.click();
     await settle();
-    assert.equal(state.fixRequests, undefined, "the UI-only action must not call the existing endpoint");
-    assert.equal(fix.textContent, "Fix");
+    assert.deepEqual(state.fixRequests, [{ threadId: 1, commentId: 2 }]);
+    assert.equal(fix.textContent, "Sent");
+    assert.equal(fix.disabled, true);
     assert.match(styles, /\.comment-header\s*\{[^}]*padding: var\(--base-size-4/);
     assert.match(styles, /\.comment-header\s*\{[^}]*align-items: center/);
     assert.match(styles, /\.comment-header\s*\{[^}]*background: var\(--background-color-muted/);

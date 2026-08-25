@@ -390,10 +390,23 @@ function renderThread(thread, options) {
             });
             footer.append(status);
         }
-        if (isActive) {
+        if (isActive && parentCommentId && options.onFixComment) {
             const fix = element("button", "primer-button secondary comment-fix-button");
             fix.type = "button";
             fix.append(copilotIcon(), element("span", "", "Fix"));
+            fix.addEventListener("click", async () => {
+                const controls = [...footer.querySelectorAll("button")];
+                controls.forEach((control) => { control.disabled = true; });
+                message.hidden = true;
+                try {
+                    await options.onFixComment(thread.id, parentCommentId);
+                    fix.querySelector("span").textContent = "Sent";
+                } catch (error) {
+                    message.textContent = error?.message || "Could not send the comment for fixing.";
+                    message.hidden = false;
+                    controls.forEach((control) => { control.disabled = false; });
+                }
+            });
             footer.append(fix);
         }
         footer.append(message);

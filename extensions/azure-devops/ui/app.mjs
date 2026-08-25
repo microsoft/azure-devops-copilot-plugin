@@ -896,6 +896,14 @@ function renderPullRequestTab(tab) {
             `${status === "fixed" ? "Resolved" : "Reopened"} discussion ${threadId}.`,
             { timelineFilter: status === "fixed" ? "resolved" : "active" },
         ),
+        onFixComment: async (threadId, commentId) => {
+            await request("/api/fix-comment", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ threadId, commentId }),
+            });
+            addLog("trace", `Sent discussion ${threadId} to Copilot for fixing.`);
+        },
         onStateAction: (action) => pullRequestStateAction(tab, action),
         onSetReviewer: (reviewerId, isRequired) => pullRequestAction(
             tab,
