@@ -1619,10 +1619,9 @@ test("a connection with no project offers to pick one instead of showing an empt
             { source: "default", organization: "fabrikam", project: "", isRemote: false, isDefault: true, requiresProject: true, prs: [], workItems: [11] },
         ],
     });
-    assert.match(
+    assert.doesNotMatch(
         window.document.querySelector("#homeContent").textContent,
         /Azure DevOps lists pull requests by project/,
-        "the limit is stated rather than shown as a missing result",
     );
     const choose = [...window.document.querySelectorAll("#homeContent button")].find((el) => el.textContent === "Choose a project");
     assert.ok(choose, "and there is a way to fix it from where the user noticed it");

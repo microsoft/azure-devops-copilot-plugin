@@ -270,7 +270,6 @@ function connectionSections(connection, {
     const pullRequestScope = myPullRequests.scope || connection.project || "";
     const pullRequests = section("Active pull requests", pullRequestScope);
     if (connection.requiresProject) {
-        pullRequests.append(statusCard("Azure DevOps lists pull requests by project. Choose a project to see yours."));
         if (onChooseProject) {
             const choose = element("button", "secondary", "Choose a project");
             choose.type = "button";
