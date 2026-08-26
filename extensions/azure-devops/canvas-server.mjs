@@ -2675,7 +2675,9 @@ async function queryMyOpenProjectWorkItems(config, project, top) {
     const query = [
         "SELECT [System.Id], [System.Title], [System.State], [System.WorkItemType], [System.AssignedTo], [System.ChangedDate]",
         "FROM WorkItems",
-        `WHERE [System.AssignedTo] = @Me ${stateFilter}`,
+        // Azure DevOps does not reliably constrain WIQL WorkItems queries to the
+        // project named in the route, so include the project in the predicate.
+        `WHERE [System.AssignedTo] = @Me AND [System.TeamProject] = ${wiqlString(project)} ${stateFilter}`,
         "ORDER BY [System.ChangedDate] DESC",
     ].join(" ");
     const queryResult = await fetchJson(config, `${encodeURIComponent(project)}/_apis/wit/wiql`, {
@@ -3608,20 +3610,23 @@ async function searchWorkItems(overrides = {}) {
         if (/^\d+$/.test(query)) {
             const id = Number(query);
             const [workItem] = await fetchWorkItemsByIds(config, project, [id], { tolerateFailure: true });
-            const [mapped] = workItem
+            const belongsToProject = normalizeString(workItem?.fields?.["System.TeamProject"]).toLowerCase()
+                === project.toLowerCase();
+            const [mapped] = belongsToProject
                 ? await mapWorkItemSummaries(config, project, [workItem])
                 : [];
             return {
                 workItems: mapped ? [mapped] : [],
-                count: workItem ? 1 : 0,
-                error: workItem ? "" : `Work item ${id} was not found in ${project}.`,
+                count: mapped ? 1 : 0,
+                error: mapped ? "" : `Work item ${id} was not found in ${project}.`,
             };
         }
 
         const stateFilter = await getTerminalWorkItemStateFilter(config, project);
+        const projectFilter = `[System.TeamProject] = ${wiqlString(project)}`;
         const where = query
-            ? `[System.Title] CONTAINS ${wiqlString(query)} ${stateFilter}`
-            : `[System.AssignedTo] = @Me ${stateFilter}`;
+            ? `[System.Title] CONTAINS ${wiqlString(query)} AND ${projectFilter} ${stateFilter}`
+            : `[System.AssignedTo] = @Me AND ${projectFilter} ${stateFilter}`;
         const wiql = [
             "SELECT [System.Id], [System.Title], [System.State], [System.WorkItemType], [System.ChangedDate]",
             "FROM WorkItems",

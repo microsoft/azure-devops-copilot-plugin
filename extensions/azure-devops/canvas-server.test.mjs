@@ -1947,6 +1947,10 @@ test("a connection with a project still uses the exact project-scoped query", as
         await namespace.queryMyOpenWorkItems({ organization: "fabrikam", project: "Project" });
         const wiql = requests.find((request) => request.pathname.endsWith("/_apis/wit/wiql"));
         assert.equal(wiql.pathname, "/fabrikam/Project/_apis/wit/wiql");
+        assert.ok(
+            wiql.body.includes("[System.TeamProject] = 'Project'"),
+            "the project is an explicit WIQL predicate, not only a route segment",
+        );
         assert.ok(wiql.body.includes("[System.State] NOT IN ('Finished')"), "the filter is expressed in the query");
     } finally {
         canvas.close();
@@ -2202,7 +2206,13 @@ test("an avatar descriptor keeps its casing and has to look like a descriptor", 
 // pull request actions make. Only the endpoints these tests exercise are
 // modelled; anything else is a failure rather than an empty success, so a route
 // that starts calling something new cannot pass silently.
-function azureDevOpsStub({ pullRequest = {}, workItemRelations = [], identityResults, workItemSearchIds } = {}) {
+function azureDevOpsStub({
+    pullRequest = {},
+    workItemRelations = [],
+    identityResults,
+    workItemSearchIds,
+    workItemSearchItems,
+} = {}) {
     const requests = [];
     const current = {
         pullRequestId: 42,
@@ -2277,7 +2287,13 @@ function azureDevOpsStub({ pullRequest = {}, workItemRelations = [], identityRes
         if (path.endsWith("/statuses")) return json({ value: [] });
         if (path.endsWith("/iterations")) return json({ value: [] });
         if (/\/_apis\/wit\/workitems$/.test(lowerPath) || lowerPath.includes("/_apis/wit/workitemsbatch")) {
-            return json({ value: [{ id: 55, fields: {}, relations: workItemRelations }] });
+            return json({
+                value: workItemSearchItems || [{
+                    id: 55,
+                    fields: { "System.TeamProject": "project" },
+                    relations: workItemRelations,
+                }],
+            });
         }
         if (lowerPath.includes("/_apis/wit/workitems/")) return json({ id: 55, fields: {} });
         if (lowerPath.endsWith("/_apis/wit/wiql")) {
@@ -2857,6 +2873,7 @@ test("the work item picker suggests the user's own work items before anything is
         assert.deepEqual(plain(result.workItems).map((item) => item.id), [55]);
         const wiql = ado.requests.find((request) => request.wiql)?.wiql;
         assert.match(wiql, /\[System\.AssignedTo\] = @Me/, "with no query it suggests the user's own work items");
+        assert.match(wiql, /\[System\.TeamProject\] = 'project'/);
     } finally {
         canvas.close();
     }
@@ -2869,6 +2886,7 @@ test("a text query searches the project by title", async () => {
         await namespace.searchWorkItems({ organization: "fabrikam", project: "project", query: "canvas" });
         const wiql = ado.requests.find((request) => request.wiql)?.wiql;
         assert.match(wiql, /\[System\.Title\] CONTAINS 'canvas'/);
+        assert.match(wiql, /\[System\.TeamProject\] = 'project'/);
     } finally {
         canvas.close();
     }
@@ -2892,6 +2910,24 @@ test("a numeric work item query resolves the id directly instead of searching ti
     try {
         const result = await namespace.searchWorkItems({ organization: "fabrikam", project: "project", query: "55" });
         assert.deepEqual(plain(result.workItems).map((item) => item.id), [55]);
+        assert.equal(ado.requests.some((request) => request.wiql), false, "no WIQL query is issued for an id");
+    } finally {
+        canvas.close();
+    }
+});
+
+test("a numeric work item query rejects an item outside the current project", async () => {
+    const { namespace, ado } = await loadWithAzureDevOps({
+        workItemSearchItems: [{
+            id: 55,
+            fields: { "System.TeamProject": "other-project" },
+        }],
+    });
+    const canvas = await startCanvas(namespace);
+    try {
+        const result = await namespace.searchWorkItems({ organization: "fabrikam", project: "project", query: "55" });
+        assert.deepEqual(plain(result.workItems), []);
+        assert.equal(result.error, "Work item 55 was not found in project.");
         assert.equal(ado.requests.some((request) => request.wiql), false, "no WIQL query is issued for an id");
     } finally {
         canvas.close();
