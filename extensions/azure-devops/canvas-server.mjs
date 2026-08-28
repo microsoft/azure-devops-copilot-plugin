@@ -179,7 +179,7 @@ async function detectAzureDevOpsRemote(workspacePath) {
 
     let firstFetchRemote = null;
     for (const line of stdout.split(/\r?\n/)) {
-        const match = line.match(/^(\S+)\s+(\S+)\s+\((fetch|push)\)$/);
+        const match = line.match(/^(\S+)\s+(.+)\s+\((fetch|push)\)$/);
         if (!match || match[3] !== "fetch") {
             continue;
         }
@@ -3229,6 +3229,45 @@ async function patchPullRequest(context, body) {
     };
 }
 
+const PULL_REQUEST_COMPLETION_POLL_INTERVAL_MS = 250;
+const PULL_REQUEST_COMPLETION_POLL_TIMEOUT_MS = 10_000;
+
+function wait(milliseconds) {
+    return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+// Azure DevOps accepts a completion PATCH before it has updated the PR status.
+// The merge status can advance before that status does, so completion waits for
+// the authoritative PR status rather than treating a changed merge status as a
+// completed state.
+async function waitForPullRequestCompletion(context, updated) {
+    let current = updated;
+    const deadline = Date.now() + PULL_REQUEST_COMPLETION_POLL_TIMEOUT_MS;
+    while (
+        normalizeString(current.status).toLowerCase() === "active" &&
+        Date.now() < deadline
+    ) {
+        await wait(PULL_REQUEST_COMPLETION_POLL_INTERVAL_MS);
+        current = await fetchJson(
+            context.config,
+            `${encodeURIComponent(context.project)}/_apis/git/pullrequests/${context.reference.id}`,
+            { apiVersion: PREVIEW_API_VERSION },
+        );
+    }
+    if (normalizeString(current.status).toLowerCase() === "active") {
+        throw new CanvasError(
+            "azure_devops_pull_request_completion_pending",
+            "Azure DevOps is still completing this pull request. Refresh to check its final state.",
+        );
+    }
+    return {
+        pullRequest: await getPullRequestDetails(context.config, context.project, {
+            ...context.current,
+            ...current,
+        }),
+    };
+}
+
 async function updatePullRequest(overrides = {}) {
     const title = overrides.title === undefined ? undefined : normalizeString(overrides.title);
     const description = overrides.description === undefined ? undefined : normalizeRichText(overrides.description);
@@ -3461,7 +3500,10 @@ async function completePullRequest(overrides = {}) {
             "Azure DevOps did not report a merge source commit, so this pull request cannot be completed from the canvas.",
         );
     }
-    return patchPullRequest(context, {
+    const updated = await fetchJson(context.config, context.basePath, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
         status: "completed",
         lastMergeSourceCommit,
         completionOptions: {
@@ -3472,7 +3514,9 @@ async function completePullRequest(overrides = {}) {
                 ? true
                 : Boolean(overrides.transitionWorkItems),
         },
+        }),
     });
+    return waitForPullRequestCompletion(context, updated);
 }
 
 function requireReviewerId(value) {

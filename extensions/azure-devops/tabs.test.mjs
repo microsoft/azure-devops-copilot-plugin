@@ -57,6 +57,7 @@ function makeFetch(state) {
         const path = String(url);
         const json = (body) => ({ ok: true, json: async () => body });
         if (path.includes("/api/config")) {
+            state.configRequests = (state.configRequests || 0) + 1;
             const response = json({
                 apiNonce: "n",
                 authProcess: state.configAuthProcess || null,
@@ -1865,7 +1866,7 @@ test("a draft pull request leads with publish", describeDom, async () => {
 });
 
 test("completing asks before it merges, and cancelling leaves the pull request alone", describeDom, async () => {
-    const { window, state } = await boot({ homePrs: [101] });
+    const { window, state } = await boot({ homePrs: [101], afterAction: { prStatus: "completed" } });
     await openFromHome(window, "!101");
 
     window.document.querySelector(".pr-state-control .pr-primary-button").click();
@@ -1886,6 +1887,35 @@ test("completing asks before it merges, and cancelling leaves the pull request a
     window.document.querySelector(".pr-confirm-accept").click();
     await settle();
     assert.deepEqual(state.prActions, [{ id: 101, action: "complete", method: "POST", body: {} }]);
+    assert.equal(
+        window.document.querySelector(".pr-state-control .pr-primary-button"),
+        null,
+        "the completed state is rendered from the refreshed pull request",
+    );
+});
+
+test("footer refresh reloads the selected tab without returning to Home", describeDom, async () => {
+    const { window, state } = await boot({ homePrs: [101] });
+    await openFromHome(window, "!101");
+    state.prStatus = "completed";
+
+    window.document.getElementById("refreshButton").click();
+    await settle();
+
+    assert.equal(activeTitle(window), "PR !101");
+    assert.equal(window.document.getElementById("homePanel").hidden, true);
+    assert.equal(window.document.querySelector(".pr-state-control .pr-primary-button"), null);
+});
+
+test("footer refresh reloads the canvas when there is no active tab", describeDom, async () => {
+    const { window, state } = await boot({ remote: { isAzureDevOps: false }, connections: [] });
+    assert.equal(state.configRequests, 1);
+
+    window.document.getElementById("refreshButton").click();
+    await settle();
+
+    assert.equal(state.configRequests, 2);
+    assert.equal(window.document.getElementById("connectionPanel").hidden, false);
 });
 
 test("abandoning asks before it closes the pull request", describeDom, async () => {

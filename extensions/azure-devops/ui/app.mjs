@@ -1494,6 +1494,50 @@ async function refresh() {
     }
 }
 
+async function refreshActiveTab() {
+    const tab = activeTab();
+    if (!tab) {
+        return refresh();
+    }
+    if (!confirmDiscard([tab])) {
+        return;
+    }
+    refreshButton.disabled = true;
+    addLog("trace", `Refreshing ${tabTitle(tab)}.`);
+    try {
+        const configResponse = await loadConfig();
+        await finishSilentAuthentication(configResponse.authProcess);
+        if (!currentConfig.auth?.isAuthenticated) {
+            showSignInSplash();
+            return;
+        }
+        showCanvas();
+        const entry = tabEntry(tab);
+        if (entry.view === "home") {
+            homeLoaded = false;
+            if (currentConfig.remote?.isAzureDevOps && currentConfig.branch && !currentConfig.pullRequestReference) {
+                await loadLeadPullRequest({ isReference: false });
+            }
+            await loadHome();
+            return;
+        }
+        tab.token += 1;
+        const token = tab.token;
+        if (entry.view === "pull-request") {
+            await loadPullRequestIntoTab(tab, entry.id, token);
+        } else {
+            await loadWorkItemIntoTab(tab, entry, token);
+        }
+        renderTabBar();
+        showActivePanel();
+    } catch (error) {
+        addLog("error", `Failed to refresh ${tabTitle(tab)}.`, error.message || "");
+        showStatus(tab.content, error.message || `Failed to refresh ${tabTitle(tab)}.`, refreshActiveTab);
+    } finally {
+        refreshButton.disabled = false;
+    }
+}
+
 showLogsButton.addEventListener("click", () => {
     logsPanel.hidden = !logsPanel.hidden;
     showLogsButton.textContent = logsPanel.hidden ? "show logs" : "hide logs";
@@ -1509,7 +1553,7 @@ copyLogsButton.addEventListener("click", async () => {
         addLog("error", "Failed to copy logs.", error.message || "");
     }
 });
-refreshButton.addEventListener("click", refresh);
+refreshButton.addEventListener("click", refreshActiveTab);
 connectionsButton.addEventListener("click", () => {
     // With nothing configured the picker is the canvas, so the control focuses it
     // rather than closing it onto a blank pane.

@@ -548,6 +548,36 @@ test("visualstudio.com remotes ignore the legacy DefaultCollection segment", asy
     );
 });
 
+test("remote detection preserves spaces and multibyte Azure DevOps path segments", async () => {
+    const stubs = discoveryStubs({ installed: false });
+    const remoteUrl = "https://dev.azure.com/example-org/Svenska Projekt 你好/_git/Räksmörgås 🚀";
+    const execFileImpl = (file, args, options, callback) => {
+        const done = typeof options === "function" ? options : callback;
+        assert.equal(file, "git");
+        assert.deepEqual(Array.from(args), ["remote", "-v"]);
+        done(null, { stdout: `origin\t${remoteUrl} (fetch)\norigin\t${remoteUrl} (push)\n`, stderr: "" });
+    };
+    const namespace = await loadCanvasServer({ execFileImpl, ...stubs });
+    namespace.setCopilotSession({
+        workspacePath: resolve("/workspace"),
+        rpc: { metadata: { snapshot: async () => ({ workingDirectory: "/workspace" }) } },
+    });
+
+    assert.deepEqual(
+        structuredClone(await namespace.detectAzureDevOpsRemoteFromWorkspace()),
+        {
+            workspacePath: resolve("/workspace"),
+            remoteName: "origin",
+            remoteUrl,
+            isAzureDevOps: true,
+            organization: "example-org",
+            project: "Svenska Projekt 你好",
+            repository: "Räksmörgås 🚀",
+            url: "https://dev.azure.com/example-org/Svenska%20Projekt%20%E4%BD%A0%E5%A5%BD/_git/R%C3%A4ksm%C3%B6rg%C3%A5s%20%F0%9F%9A%80",
+        },
+    );
+});
+
 test("comment fix requests send a guarded prompt without requiring a specific integration", async () => {
     const stubs = discoveryStubs({ installed: false });
     const { impl: execFileImpl } = execFileStub((done) => done(null, { stdout: "", stderr: "" }));
@@ -2212,6 +2242,7 @@ function azureDevOpsStub({
     identityResults,
     workItemSearchIds,
     workItemSearchItems,
+    completionPollsBeforeCompleted = 0,
 } = {}) {
     const requests = [];
     const current = {
@@ -2232,6 +2263,7 @@ function azureDevOpsStub({
         },
         ...pullRequest,
     };
+    let pendingCompletionPolls = 0;
     const fetchImpl = async (input, options = {}) => {
         const url = String(input?.url || input);
         const parsedUrl = new URL(url);
@@ -2251,7 +2283,14 @@ function azureDevOpsStub({
         if (path.endsWith("/_apis/connectionData")) {
             return json({ authenticatedUser: { id: "me", displayName: "Me" } });
         }
-        if (/\/_apis\/git\/pullrequests\/\d+$/.test(path)) {
+        if (/\/_apis\/git\/pullrequests\/\d+$/.test(path) && method === "GET") {
+            if (pendingCompletionPolls > 0) {
+                pendingCompletionPolls -= 1;
+                if (!pendingCompletionPolls) {
+                    current.status = "completed";
+                    current.mergeStatus = "succeeded";
+                }
+            }
             return json(current);
         }
         if (/\/pullrequests\/\d+\/reviewers$/.test(path)) {
@@ -2273,7 +2312,14 @@ function azureDevOpsStub({
             return json({ id: reviewerId });
         }
         if (/\/pullrequests\/\d+$/.test(path) && method === "PATCH") {
-            return json({ ...current, ...JSON.parse(options.body) });
+            const patch = JSON.parse(options.body);
+            Object.assign(current, patch);
+            if (patch.status === "completed" && completionPollsBeforeCompleted) {
+                current.status = "active";
+                current.mergeStatus = "queued";
+                pendingCompletionPolls = completionPollsBeforeCompleted;
+            }
+            return json(current);
         }
         if (/\/pullrequests\/\d+\/threads\/\d+\/comments$/.test(lowerPath) && method === "POST") {
             return json({ id: 2 });
@@ -2435,16 +2481,23 @@ test("an unknown status action is refused before any request is made", async () 
 });
 
 test("completing a pull request sends the merge commit and never bypasses policy", async () => {
-    const { namespace, ado } = await loadWithAzureDevOps();
+    const { namespace, ado } = await loadWithAzureDevOps({ completionPollsBeforeCompleted: 2 });
     const canvas = await startCanvas(namespace);
     try {
-        await namespace.completePullRequest({ ...pullRequestReference, deleteSourceBranch: true });
+        const result = await namespace.completePullRequest({ ...pullRequestReference, deleteSourceBranch: true });
         const write = ado.requests.find((request) => request.method === "PATCH");
         assert.equal(write.body.status, "completed");
         assert.deepEqual(write.body.lastMergeSourceCommit, { commitId: "abc123" });
         assert.equal(write.body.completionOptions.bypassPolicy, false);
         assert.equal(write.body.completionOptions.deleteSourceBranch, true);
         assert.equal(write.body.completionOptions.transitionWorkItems, true);
+        assert.equal(result.pullRequest.status, "completed");
+        assert.equal(
+            ado.requests.filter((request) =>
+                request.method === "GET" && /\/_apis\/git\/pullrequests\/42$/.test(request.path)).length,
+            3,
+            "completion re-reads an active pull request until Azure DevOps completes it",
+        );
     } finally {
         canvas.close();
     }
