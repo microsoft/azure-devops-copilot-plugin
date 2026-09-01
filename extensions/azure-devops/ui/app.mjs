@@ -897,11 +897,14 @@ function renderPullRequestTab(tab) {
             { timelineFilter: status === "fixed" ? "resolved" : "active" },
         ),
         onFixComment: async (threadId, commentId) => {
-            await request("/api/fix-comment", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ threadId, commentId }),
-            });
+            await request(
+                `/api/pull-requests/${encodeURIComponent(tab.data.id)}/fix-comment${connectionQuery(tabEntry(tab))}`,
+                {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ threadId, commentId }),
+                },
+            );
             addLog("trace", `Sent discussion ${threadId} to Copilot for fixing.`);
         },
         onStateAction: (action) => pullRequestStateAction(tab, action),

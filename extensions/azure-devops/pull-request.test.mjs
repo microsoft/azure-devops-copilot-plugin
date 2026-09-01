@@ -34,6 +34,8 @@ test("mapPullRequest maps a raw Azure DevOps payload", () => {
     assert.equal(mapped.id, 4242);
     assert.equal(mapped.repository, "catalog");
     assert.equal(mapped.repositoryId, repository.id);
+    assert.equal(mapped.sourceRepository, "catalog");
+    assert.equal(mapped.sourceRepositoryId, repository.id);
     assert.equal(mapped.createdBy, "Test Author");
     assert.equal(mapped.webUrl, "https://dev.azure.com/contoso/widgets/_git/catalog/pullrequest/4242");
     // description keeps its markup now that the canvas renders rich text.
@@ -50,6 +52,22 @@ test("mapPullRequest maps a raw Azure DevOps payload", () => {
         isContainer: false,
         hasDeclined: false,
     }]);
+});
+
+test("mapPullRequest preserves a fork's source repository for comment fixes", () => {
+    const mapped = mapPullRequest(rawPullRequest({
+        forkSource: {
+            repository: {
+                id: "fork-repository-id",
+                name: "contributor-catalog",
+            },
+        },
+    }), repository);
+
+    assert.equal(mapped.repository, "catalog");
+    assert.equal(mapped.repositoryId, repository.id);
+    assert.equal(mapped.sourceRepository, "contributor-catalog");
+    assert.equal(mapped.sourceRepositoryId, "fork-repository-id");
 });
 
 test("mapPullRequest derives webUrl from the repository when _links is absent", () => {

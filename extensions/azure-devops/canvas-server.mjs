@@ -2159,28 +2159,27 @@ async function getCommentFixEligibility(pullRequest) {
     if (!config.remote?.isAzureDevOps || !config.repositoryId || !currentBranch) {
         return {
             eligible: false,
-            message: "Fix is available only when this session is on the pull request target repository and branch.",
+            message: "Fix is available only when this session is on the pull request source repository and branch.",
         };
     }
 
     const repository = await resolveRepository({ config });
     const sameRepository = normalizeString(repository.id).toLowerCase() ===
-        normalizeString(pullRequest.repositoryId).toLowerCase();
+        normalizeString(pullRequest.sourceRepositoryId).toLowerCase();
     const currentRefName = branchRefName(currentBranch);
-    const sameBranch = currentRefName === normalizeString(pullRequest.targetRefName);
+    const sameBranch = currentRefName === normalizeString(pullRequest.sourceRefName);
     if (!sameRepository || !sameBranch) {
-        const targetBranch = normalizeString(pullRequest.targetRefName).replace(/^refs\/heads\//, "");
+        const sourceBranch = normalizeString(pullRequest.sourceRefName).replace(/^refs\/heads\//, "");
         const sessionBranch = currentRefName.replace(/^refs\/heads\//, "");
         return {
             eligible: false,
-            message: `Fix is available only from ${pullRequest.repository}/${targetBranch}. This session is on ${repository.name}/${sessionBranch}.`,
+            message: `Fix is available only from ${pullRequest.sourceRepository}/${sourceBranch}. This session is on ${repository.name}/${sessionBranch}.`,
         };
     }
     return { eligible: true, message: "" };
 }
 
-async function requestCommentFix(entry, threadId, commentId) {
-    const pullRequest = await getPullRequestForCanvas(entry);
+async function requestCommentFix(pullRequest, threadId, commentId) {
     const thread = (pullRequest.commentThreads || []).find((candidate) => Number(candidate.id) === Number(threadId));
     const comment = thread?.comments?.find((candidate) => Number(candidate.id) === Number(commentId));
     if (!thread?.isResolvable || !comment) {
@@ -4400,9 +4399,19 @@ async function handleApi(entry, req, res, url) {
             );
             return;
         }
-        if (req.method === "POST" && url.pathname === "/api/fix-comment") {
+        if (req.method === "POST" && /^\/api\/pull-requests\/\d+\/fix-comment$/.test(url.pathname)) {
+            const id = Number(url.pathname.split("/").at(-2));
             const body = await readRequestBody(req);
-            await requestCommentFix(entry, body.threadId, body.commentId);
+            const connection = await requireConnection(entry.input, connectionSelector(url));
+            const { pullRequest } = await getPullRequest({
+                ...entry.input,
+                id,
+                pullRequestId: id,
+                pullRequestUrl: "",
+                ...connectionOverrides(connection),
+                repositoryId: "",
+            });
+            await requestCommentFix(pullRequest, body.threadId, body.commentId);
             jsonResponse(res, 200, { queued: true });
             return;
         }

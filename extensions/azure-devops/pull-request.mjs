@@ -53,6 +53,9 @@ export function mapPullRequest(pr, repositoryOverride = {}) {
     const id = pr.pullRequestId ?? pr.id;
     const rawRepository = pr.repository && typeof pr.repository === "object" ? pr.repository : {};
     const repository = { ...repositoryOverride, ...rawRepository };
+    const rawSourceRepository = pr.forkSource?.repository && typeof pr.forkSource.repository === "object"
+        ? pr.forkSource.repository
+        : {};
     const repositoryWebUrl = normalizeString(repository.webUrl);
     const createdBy = typeof pr.createdBy === "string" ? pr.createdBy : pr.createdBy?.displayName || "";
     return {
@@ -61,6 +64,10 @@ export function mapPullRequest(pr, repositoryOverride = {}) {
         status: pr.status,
         repository: repository.name || (typeof pr.repository === "string" ? pr.repository : ""),
         repositoryId: repository.id || "",
+        // Azure DevOps uses `repository` for the target. A fork can have a
+        // different source repository where comment fixes must be applied.
+        sourceRepository: rawSourceRepository.name || pr.sourceRepository || repository.name || "",
+        sourceRepositoryId: rawSourceRepository.id || pr.sourceRepositoryId || repository.id || "",
         sourceRefName: pr.sourceRefName || "",
         targetRefName: pr.targetRefName || "",
         createdBy,

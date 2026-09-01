@@ -150,8 +150,9 @@ function makeFetch(state) {
             });
             return state.holdHome ? state.holdHome.then(() => response) : response;
         }
-        if (path.includes("/api/fix-comment")) {
+        if (/\/api\/pull-requests\/\d+\/fix-comment(?:\?|$)/.test(path)) {
             state.fixRequests = [...(state.fixRequests || []), JSON.parse(options.body)];
+            state.fixRequestUrls = [...(state.fixRequestUrls || []), path];
             return json({ queued: true });
         }
         if (path.includes("/api/new-session-branch")) {
@@ -888,6 +889,7 @@ test("code comment threads use one file header and send the root comment for fix
     fix.click();
     await settle();
     assert.deepEqual(state.fixRequests, [{ threadId: 1, commentId: 2 }]);
+    assert.match(state.fixRequestUrls[0], /\/api\/pull-requests\/101\/fix-comment\?organization=example&project=project$/);
     assert.equal(fix.textContent, "Sent");
     assert.equal(fix.disabled, true);
     assert.equal(window.document.querySelector(".comment-reply-button")?.disabled, false);
