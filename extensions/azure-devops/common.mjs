@@ -1,4 +1,20 @@
 // Shared Azure DevOps canvas text utilities.
+// Preview-only surfaces remain disabled unless the user enables them from the
+// canvas logs panel. The distribution transform removes that panel's controls.
+export const AGENCY_AUTH_ENABLED = false;
+export const PULL_REQUEST_REVIEW_VOTING_ENABLED = false;
+export const DEFAULT_FEATURE_FLAGS = Object.freeze({
+    boards: false,
+    delegation: false,
+});
+
+export function normalizeFeatureFlags(value = {}) {
+    return {
+        boards: value.boards === true,
+        delegation: value.delegation === true,
+    };
+}
+
 export function normalizeString(value) {
     return typeof value === "string" ? value.trim() : "";
 }

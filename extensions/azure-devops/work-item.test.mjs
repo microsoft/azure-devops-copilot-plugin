@@ -429,6 +429,8 @@ test("development artifacts and related work map to navigable sidebar links", ()
     });
 
     const development = item.relations.find((group) => group.name === "Development").links;
+    assert.equal(development[0].projectId, "project-guid");
+    assert.equal(development[0].repositoryId, "repo-guid");
     assert.deepEqual(
         development.map((entry) => [entry.kind, entry.label, entry.webUrl]),
         [

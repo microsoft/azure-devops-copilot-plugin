@@ -58,6 +58,24 @@ const descriptionSection = {
     fields: [{ name: "Description", field: "System.Description", isHtml: true, value: "<p>Body</p>" }],
 };
 
+test("delegate menus have unique document ids across simultaneous work-item renders", needsDom, () => {
+    const first = render(workItem(), { onDelegateLocal() {} });
+    const second = render(workItem(), { onDelegateLocal() {} });
+    const root = document.createElement("div");
+    root.append(first, second);
+    document.body.append(root);
+    try {
+        const menus = [...root.querySelectorAll(".primer-action-list")];
+        const triggers = [...root.querySelectorAll(".primer-action-menu-trigger")];
+        assert.equal(menus.length, 2);
+        assert.notEqual(menus[0].id, menus[1].id);
+        assert.deepEqual(triggers.map((trigger) => trigger.getAttribute("aria-controls")), menus.map((menu) => menu.id));
+        assert.deepEqual(menus.map((menu) => document.getElementById(menu.id)), menus);
+    } finally {
+        root.remove();
+    }
+});
+
 test("a lone field named after its section is labelled once", needsDom, () => {
     // Azure DevOps templates commonly put System.Description in a group also
     // called "Description", which used to render the word twice.
@@ -115,15 +133,9 @@ test("renders a grouped overview and Primer-style content cards", needsDom, () =
     assert.equal(overview.querySelector(".work-item-reference").textContent, "#42");
     assert.ok(overview.querySelector(".work-item-type"));
     assert.equal(overview.querySelector(".state-pill"), null, "state belongs in the details panel");
-    const open = overview.querySelector(".work-item-open-button");
-    // Named for where it goes, not for what it opens: "Open work item" read like
-    // an in-canvas action next to the ones that are.
-    assert.equal(open.textContent, "View on Azure DevOps");
-    assert.equal(open.querySelector("svg"), null, "a plain label, with no link icon");
-    assert.ok(open.classList.contains("primer-button"));
-    assert.ok(open.classList.contains("secondary"));
+    assert.equal(overview.querySelector(".work-item-open-button"), null);
 
-    assert.ok(host.querySelector(".work-item-header-actions .inline-edit"));
+    assert.ok(host.querySelector(".work-item-title-row > .inline-edit"));
     assert.ok(host.querySelector(".work-item-meta-avatar .identity-avatar-image"));
     assert.equal(host.querySelectorAll(".work-item-card").length, 5);
     assert.deepEqual(
@@ -133,6 +145,12 @@ test("renders a grouped overview and Primer-style content cards", needsDom, () =
     );
     assert.doesNotMatch(host.querySelector(".work-item-details").textContent, /Priority/);
     assert.ok(host.querySelector(".work-item-details .state-pill"));
+    assert.deepEqual(
+        [...host.querySelectorAll(".work-item-details .detail-value")].map((node) => node.title),
+        ["Active", "Work started", "Widgets / Canvas", "Sprint 12"],
+        "every truncated summary value exposes its full text on hover",
+    );
+    assert.equal(host.querySelector(".state-pill-label")?.textContent, "Active");
     assert.ok(host.querySelector(".work-item-body.has-sidebar"));
     assert.equal(
         host.querySelector(".work-item-main-column .template-section .section-title").textContent,
@@ -164,6 +182,58 @@ test("renders a grouped overview and Primer-style content cards", needsDom, () =
         ["primer-link relation-link", "relation-meta"],
         "related-work rows stay within two text lines",
     );
+});
+
+test("pull request relations use canvas navigation when it is available", needsDom, () => {
+    let openedPullRequest = 0;
+    const host = render(workItem({
+        relations: [{
+            name: "Development",
+            links: [{
+                id: 0,
+                kind: "pull-request",
+                kindLabel: "Pull request",
+                projectId: "project-id",
+                repositoryId: "repository-id",
+                identifier: "81",
+                label: "Pull request 81",
+                title: "Polish the layout",
+                webUrl: "https://dev.azure.com/o/p/_git/r/pullrequest/81",
+            }],
+        }],
+    }), {
+        onOpenPullRequest(relation) {
+            openedPullRequest = relation;
+        },
+    });
+    const target = host.querySelector(".development-section .relation-link");
+
+    assert.equal(target?.tagName, "BUTTON");
+    target.click();
+    assert.equal(openedPullRequest.identifier, "81");
+    assert.equal(openedPullRequest.projectId, "project-id");
+    assert.equal(openedPullRequest.repositoryId, "repository-id");
+});
+
+test("pull request relations fall back to their Azure DevOps URL without repository context", needsDom, () => {
+    const host = render(workItem({
+        relations: [{
+            name: "Development",
+            links: [{
+                id: 0,
+                kind: "pull-request",
+                kindLabel: "Pull request",
+                projectId: "project-id",
+                identifier: "81",
+                label: "Pull request 81",
+                webUrl: "https://dev.azure.com/o/p/_git/r/pullrequest/81",
+            }],
+        }],
+    }), { onOpenPullRequest() {} });
+
+    const target = host.querySelector(".development-section .relation-link");
+    assert.equal(target?.tagName, "A");
+    assert.equal(target?.href, "https://dev.azure.com/o/p/_git/r/pullrequest/81");
 });
 
 test("omits the sidebar when a work item has no applicable links", needsDom, () => {
@@ -321,7 +391,8 @@ test("discussion Markdown links still render as links", needsDom, () => {
 test("view mode offers one edit control for the whole item", needsDom, () => {
     const host = render(workItem({ templateSections: [descriptionSection] }));
     assert.deepEqual(editLabels(host), ["Edit this work item"]);
-    assert.ok(host.querySelector(".work-item-header-actions .inline-edit"), "it belongs beside the external action");
+    assert.ok(host.querySelector(".work-item-title-row > .inline-edit"), "it is directly appended to the title");
+    assert.equal(host.querySelector(".work-item-header-actions"), null);
     assert.equal(host.querySelectorAll(".editor").length, 0, "nothing should be editable yet");
 });
 

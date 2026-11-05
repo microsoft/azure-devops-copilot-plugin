@@ -37,6 +37,8 @@ const SVG_NS = "http://www.w3.org/2000/svg";
 
 function pencilIcon() {
     const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("data-icon-source", "octicon");
+    svg.setAttribute("data-icon-name", "pencil");
     svg.setAttribute("viewBox", "0 0 16 16");
     svg.setAttribute("width", "14");
     svg.setAttribute("height", "14");
@@ -47,7 +49,7 @@ function pencilIcon() {
     const path = document.createElementNS(SVG_NS, "path");
     path.setAttribute(
         "d",
-        "M13.23 1.77a1.75 1.75 0 0 0-2.47 0L2.5 10.03c-.19.19-.33.43-.4.7l-.85 3.02a.6.6 0 0 0 .74.74l3.02-.85c.27-.08.51-.22.7-.4l8.26-8.27a1.75 1.75 0 0 0 0-2.47ZM10.4 3.9 12.1 5.6l-6.9 6.9-1.7-1.7Z",
+        "M11.013 1.427a1.75 1.75 0 0 1 2.474 0l1.086 1.086a1.75 1.75 0 0 1 0 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 0 1-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61Zm.176 4.823L9.75 4.81l-6.286 6.287a.253.253 0 0 0-.064.108l-.558 1.953 1.953-.558a.253.253 0 0 0 .108-.064Zm1.238-3.763a.25.25 0 0 0-.354 0L10.811 3.75l1.439 1.44 1.263-1.263a.25.25 0 0 0 0-.354Z",
     );
     svg.append(path);
     return svg;
@@ -365,10 +367,10 @@ function insertMarkdownLink(textarea, url) {
  * conversion rewrites formatting the user never touched. Editing the source means
  * the value returned is the value the user typed.
  *
- * @param {{ label: string, value: string, onDirtyChange?: (dirty: boolean) => void, onSubmit?: () => void, onCancel?: () => void }} options
+ * @param {{ label: string, value: string, onDirtyChange?: (dirty: boolean) => void, onSubmit?: () => void, onCancel?: () => void, imageUrl?: (url: string) => string }} options
  * @returns {{ host: Element, getValue: () => string, isDirty: () => boolean, focus: () => void }}
  */
-export function createMarkdownField({ label, value, onDirtyChange, onSubmit, onCancel }) {
+export function createMarkdownField({ label, value, onDirtyChange, onSubmit, onCancel, imageUrl }) {
     // Only trailing whitespace is dropped, and only at the very end. Leading
     // whitespace is load-bearing -- four spaces on the first line start a code
     // block -- so trimming both ends would rewrite the description the moment the
@@ -489,7 +491,7 @@ export function createMarkdownField({ label, value, onDirtyChange, onSubmit, onC
         mode = next;
         if (mode === "preview") {
             bar.hidden = true;
-            const rendered = renderRichText(preview, currentValue(), { format: "markdown" });
+            const rendered = renderRichText(preview, currentValue(), { format: "markdown", imageUrl });
             if (!rendered) {
                 preview.replaceChildren(element("div", "status", "Nothing to preview."));
             }

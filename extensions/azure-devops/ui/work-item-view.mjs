@@ -9,6 +9,9 @@ import {
 import { createCommentComposer } from "./comment-composer.mjs";
 import { canEditStoredHtml } from "./editable-html.mjs";
 import { richTextElement } from "./rich-text.mjs";
+import { createActionMenu } from "./action-menu.mjs";
+
+let workItemRenderSequence = 0;
 
 function element(tagName, className, text) {
     const node = document.createElement(tagName);
@@ -27,10 +30,6 @@ function externalLink(text, href, className = "") {
 
 function link(text, href, className = "") {
     return externalLink(text, href, ["primer-link", className].filter(Boolean).join(" "));
-}
-
-function secondaryLink(text, href, className = "") {
-    return externalLink(text, href, ["primer-button", "secondary", className].filter(Boolean).join(" "));
 }
 
 function relativeTime(value) {
@@ -53,7 +52,8 @@ function cssColor(value) {
 }
 
 function statePill(item) {
-    const pill = element("span", "state-pill", item.state || "Unknown");
+    const pill = element("span", "state-pill");
+    pill.append(element("span", "state-pill-label", item.state || "Unknown"));
     const category = String(item.stateCategory || "").replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").toLowerCase();
     if (category) {
         pill.classList.add(`state-${category}`);
@@ -89,7 +89,8 @@ function detailsGrid(item, details, options, fields) {
     grid.style.setProperty("--detail-rows", Math.ceil(details.length / 2));
     for (const detail of details) {
         const row = element("div", "detail-item");
-        const value = element("dd");
+        const value = element("dd", "detail-value");
+        value.title = String(detail.value);
         if (detail.name.toLowerCase() === "state") {
             value.append(renderState(item, options, fields));
         } else {
@@ -114,9 +115,15 @@ function relationIcon(kind) {
     return icon;
 }
 
-function relationTarget(entry, onOpenWorkItem) {
+function relationTarget(entry, onOpenWorkItem, onOpenPullRequest) {
     let target;
-    if (entry.id && onOpenWorkItem) {
+    const pullRequestId = entry.kind === "pull-request" ? Number(entry.identifier) : 0;
+    const hasPullRequestTarget = Boolean(entry.projectId && entry.repositoryId);
+    if (Number.isInteger(pullRequestId) && pullRequestId > 0 && hasPullRequestTarget && onOpenPullRequest) {
+        target = element("button", "primer-link relation-link");
+        target.type = "button";
+        target.addEventListener("click", () => onOpenPullRequest(entry));
+    } else if (entry.id && onOpenWorkItem) {
         target = element("button", "primer-link relation-link");
         target.type = "button";
         target.addEventListener("click", () => onOpenWorkItem(entry));
@@ -133,7 +140,7 @@ function relationTarget(entry, onOpenWorkItem) {
     return target;
 }
 
-function relationRow(entry, groupName, onOpenWorkItem, development = false) {
+function relationRow(entry, groupName, onOpenWorkItem, onOpenPullRequest, development = false) {
     const row = element("article", "relation-row");
     const content = element("div", "relation-row-content");
     const metadata = [
@@ -147,7 +154,7 @@ function relationRow(entry, groupName, onOpenWorkItem, development = false) {
     if (development && meta) {
         content.append(meta);
     }
-    content.append(relationTarget(entry, onOpenWorkItem));
+    content.append(relationTarget(entry, onOpenWorkItem, onOpenPullRequest));
     if (!development && meta) {
         content.append(meta);
     }
@@ -155,7 +162,7 @@ function relationRow(entry, groupName, onOpenWorkItem, development = false) {
     return row;
 }
 
-function relationsSection(title, groups, onOpenWorkItem, { development = false } = {}) {
+function relationsSection(title, groups, onOpenWorkItem, { development = false, onOpenPullRequest } = {}) {
     const entries = groups.flatMap((group) =>
         (group.links || []).map((entry) => ({ entry, groupName: group.name })));
     if (!entries.length) {
@@ -174,7 +181,7 @@ function relationsSection(title, groups, onOpenWorkItem, { development = false }
 
     const list = element("div", "relation-list");
     for (const { entry, groupName } of entries.slice(0, 6)) {
-        list.append(relationRow(entry, groupName, onOpenWorkItem, development));
+        list.append(relationRow(entry, groupName, onOpenWorkItem, onOpenPullRequest, development));
     }
     card.append(list);
 
@@ -183,7 +190,7 @@ function relationsSection(title, groups, onOpenWorkItem, { development = false }
         overflow.append(element("summary", "primer-link relation-show-more", `Show ${entries.length - 6} more`));
         const overflowList = element("div", "relation-list relation-list-overflow");
         for (const { entry, groupName } of entries.slice(6)) {
-            overflowList.append(relationRow(entry, groupName, onOpenWorkItem, development));
+            overflowList.append(relationRow(entry, groupName, onOpenWorkItem, onOpenPullRequest, development));
         }
         overflow.append(overflowList);
         card.append(overflow);
@@ -314,7 +321,7 @@ function discussionSection(item, options) {
             "div",
             "comment-post-content comment-text",
             comment.text,
-            { format: comment.format || "html" },
+            { format: comment.format || "html", imageUrl: options.imageUrl },
         ));
         card.append(post);
         list.append(card);
@@ -454,7 +461,7 @@ function renderTemplateField(item, field, options, fields, { hideLabel = false }
             return row;
         }
         if (field.value) {
-            row.append(richTextElement("div", "section-field-value", field.value, { format: "html" }));
+            row.append(richTextElement("div", "section-field-value", field.value, { format: "html", imageUrl: options.imageUrl }));
         }
         row.append(readOnlyNotice(item, "This field contains markup the canvas cannot save safely."));
         return row;
@@ -464,6 +471,7 @@ function renderTemplateField(item, field, options, fields, { hideLabel = false }
         const control = fields.add(field.field, createMarkdownField({
             label: field.name,
             value: field.value,
+            imageUrl: options.imageUrl,
             onDirtyChange: fields.onDirtyChange,
             onSubmit: options.onSubmit,
             onCancel: options.onCancelEdit,
@@ -493,6 +501,7 @@ function renderTemplateField(item, field, options, fields, { hideLabel = false }
         // Plain template values retain the canvas's existing Markdown-capable
         // display. Rich fields use Azure DevOps' per-item format selection.
         format: format || "markdown",
+        imageUrl: options.imageUrl,
     }));
     return row;
 }
@@ -531,10 +540,11 @@ function templateSection(item, section, options, fields, { sidebar = false } = {
  *
  * @param {Element} container
  * @param {object} item mapped work item detail
- * @param {{ avatarUrl?: (url: string) => string, canEdit?: boolean, editMode?: boolean, onOpenWorkItem?: (item: { id: number, project?: string }) => void, onEdit?: () => void, onCancelEdit?: () => void, onSave?: (fields: object[]) => Promise<void>, onDirtyChange?: (dirty: boolean) => void, onSubmit?: () => void }} options
+ * @param {{ avatarUrl?: (url: string) => string, canEdit?: boolean, editMode?: boolean, onOpenWorkItem?: (item: { id: number, project?: string }) => void, onOpenPullRequest?: (relation: { identifier: string, projectId: string, repositoryId: string }) => void, onEdit?: () => void, onCancelEdit?: () => void, onSave?: (fields: object[]) => Promise<void>, onDirtyChange?: (dirty: boolean) => void, onSubmit?: () => void, onDelegateLocal?: () => void, delegationPending?: boolean, delegationStatus?: string, delegationError?: string }} options
  */
 export function renderWorkItem(container, item, options = {}) {
     container.replaceChildren();
+    const renderId = ++workItemRenderSequence;
     const view = element("article", "work-item");
     const fields = createFieldSet(() => options.onDirtyChange?.(fields.anyDirty()));
 
@@ -567,25 +577,52 @@ export function renderWorkItem(container, item, options = {}) {
     const overview = element("section", "work-item-overview");
     const header = element("header", "work-item-header");
     const headerCopy = element("div", "work-item-header-copy");
+    const edit = !options.editMode && options.canEdit
+        ? editButton("this work item", () => options.onEdit?.())
+        : null;
     headerCopy.append(headerRow(
         "work-item-title-row",
         renderHeading(item, options, fields),
-        null,
+        edit,
     ), subtitle);
     header.append(headerCopy);
     const headerActions = element("div", "work-item-header-actions");
     if (options.editMode) {
         headerActions.append(actions.host);
-    } else if (options.canEdit) {
-        headerActions.append(editButton("this work item", () => options.onEdit?.()));
-    }
-    if (item.webUrl) {
-        headerActions.append(secondaryLink("View on Azure DevOps", item.webUrl, "work-item-open-button"));
+    } else {
+        if (options.onDelegateLocal) {
+            const delegate = createActionMenu({
+                id: `work-item-${item.id}-delegate-menu-${renderId}`,
+                className: "work-item-delegate-menu",
+                triggerLabel: options.delegationPending ? "Delegating…" : "Delegate",
+                triggerAriaLabel: "Delegate work item",
+                menuAriaLabel: "Delegate work item",
+                items: [{
+                    id: "local",
+                    label: "Delegate locally",
+                    description: "Start a local Copilot session for this work item.",
+                    disabled: Boolean(options.delegationPending),
+                    onSelect: () => options.onDelegateLocal?.(),
+                }],
+            });
+            delegate.trigger.classList.add("primary");
+            delegate.trigger.disabled = Boolean(options.delegationPending);
+            headerActions.append(delegate.control);
+        }
     }
     if (headerActions.childElementCount) {
         header.append(headerActions);
     }
     overview.append(header);
+    if (options.delegationStatus || options.delegationError) {
+        const status = element(
+            "div",
+            `work-item-delegation-status${options.delegationError ? " error" : ""}`,
+            options.delegationError || options.delegationStatus,
+        );
+        status.setAttribute("role", options.delegationError ? "alert" : "status");
+        overview.append(status);
+    }
     view.append(overview);
 
     view.append(metadataSection(item, options.avatarUrl));
@@ -615,9 +652,14 @@ export function renderWorkItem(container, item, options = {}) {
         "Development",
         developmentGroups,
         options.onOpenWorkItem,
-        { development: true },
+        { development: true, onOpenPullRequest: options.onOpenPullRequest },
     );
-    const related = relationsSection("Related work", relatedGroups, options.onOpenWorkItem);
+    const related = relationsSection(
+        "Related work",
+        relatedGroups,
+        options.onOpenWorkItem,
+        { onOpenPullRequest: options.onOpenPullRequest },
+    );
     if (development) sidebar.append(development);
     if (related) sidebar.append(related);
     for (const section of sidebarSections) {

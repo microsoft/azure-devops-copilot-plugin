@@ -5,7 +5,7 @@
 // token acquisition deterministically without a real azureauth install.
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
-import { createServer } from "node:http";
+import { createServer, request } from "node:http";
 import { readFile } from "node:fs/promises";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -14,13 +14,13 @@ import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { SyntheticModule, SourceTextModule, createContext } from "node:vm";
-import { PULL_REQUEST_REVIEW_VOTING_ENABLED } from "./ui/feature-flags.mjs";
+import { PULL_REQUEST_REVIEW_VOTING_ENABLED } from "./common.mjs";
 
 const serverPath = new URL("./canvas-server.mjs", import.meta.url);
 
 // canvas-server.mjs pulls in ./common.mjs, ./pull-request.mjs and ./work-item.mjs,
 // so relative specifiers are linked recursively rather than stubbed.
-async function loadCanvasServer({ execFileImpl, existsSyncImpl, readdirSyncImpl, homedirImpl, fetchImpl = fetch, platform = "linux", env = {} }) {
+async function loadCanvasServer({ execFileImpl, existsSyncImpl, readdirSyncImpl, homedirImpl, fetchImpl = fetch, platform = "linux", env = {}, browserTokenForTest = null }) {
     const processStub = {
         platform,
         env,
@@ -78,9 +78,16 @@ async function loadCanvasServer({ execFileImpl, existsSyncImpl, readdirSyncImpl,
         throw new Error(`Unexpected import: ${specifier}`);
     }
 
-    const module = new SourceTextModule(await readFile(serverPath, "utf8"), { context, identifier: serverPath.href, initializeImportMeta });
+    // Seed synthetic OAuth state inside the VM without adding a production export.
+    const seedToken = browserTokenForTest
+        ? "\nexport { writeBrowserTokenCache as seedBrowserTokenForTest };"
+        : "";
+    const module = new SourceTextModule((await readFile(serverPath, "utf8")) + seedToken, { context, identifier: serverPath.href, initializeImportMeta });
     await module.link(linker);
     await module.evaluate();
+    if (browserTokenForTest) {
+        await module.namespace.seedBrowserTokenForTest(browserTokenForTest);
+    }
     return module.namespace;
 }
 
@@ -138,13 +145,13 @@ function execFileStub(onAzureAuth) {
     return { impl, azureAuthCalls };
 }
 
-async function startCanvas(namespace) {
+async function startCanvas(namespace, options = {}, input = {}) {
     namespace.setCopilotSession({
         workspacePath: tmpdir(),
         rpc: { mcp: { list: async () => [] }, metadata: { snapshot: async () => ({}) } },
         log: async () => {},
     });
-    const entry = await namespace.startServer("test", {});
+    const entry = await namespace.startServer("test", input, options);
     const base = entry.url.replace(/\/$/, "");
     const loadConfig = async () => (await fetch(`${base}/api/config`)).json();
     const initial = await loadConfig();
@@ -191,6 +198,542 @@ async function startCanvas(namespace) {
     return canvasApi;
 }
 
+test("the browser can load the shared common module without exposing extension files", async () => {
+    const stubs = discoveryStubs({ installed: false });
+    const { impl: execFileImpl } = execFileStub((done) => done(null, { stdout: "", stderr: "" }));
+    const namespace = await loadCanvasServer({ execFileImpl, ...stubs });
+    const canvas = await startCanvas(namespace);
+
+    try {
+        const common = await fetch(`${canvas.base}/common.mjs`);
+        assert.equal(common.status, 200);
+        assert.equal(common.headers.get("content-type"), "text/javascript; charset=utf-8");
+        assert.match(await common.text(), /export function normalizeFeatureFlags/);
+
+        const serverSource = await fetch(`${canvas.base}/canvas-server.mjs`);
+        assert.equal(serverSource.status, 404);
+    } finally {
+        canvas.close();
+    }
+});
+
+test("feature flag updates require the canvas nonce and expected Host", async () => {
+    const stubs = discoveryStubs({ installed: false });
+    const { impl: execFileImpl } = execFileStub((done) => done(null, { stdout: "", stderr: "" }));
+    const namespace = await loadCanvasServer({ execFileImpl, ...stubs });
+    const canvas = await startCanvas(namespace);
+
+    try {
+        const missingNonce = await fetch(`${canvas.base}/api/feature-flags`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ boards: true }),
+        });
+        assert.equal(missingNonce.status, 400);
+        assert.equal((await missingNonce.json()).message, "Rejected request with invalid API nonce.");
+
+        const invalidHost = await new Promise((resolve, reject) => {
+            const req = request(`${canvas.base}/api/feature-flags`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    Host: "attacker.example",
+                    "X-Canvas-Nonce": canvas.apiNonce,
+                },
+            }, (res) => {
+                const chunks = [];
+                res.on("data", (chunk) => chunks.push(chunk));
+                res.on("end", () => resolve({
+                    status: res.statusCode,
+                    json: () => JSON.parse(Buffer.concat(chunks).toString("utf8")),
+                }));
+            });
+            req.on("error", reject);
+            req.end(JSON.stringify({ boards: true }));
+        });
+        assert.equal(invalidHost.status, 400);
+        assert.equal(invalidHost.json().message, "Rejected request with unexpected Host header.");
+        assert.equal(canvas.entry.featureFlags.boards, false);
+    } finally {
+        canvas.close();
+    }
+});
+
+test("disabling Boards closes issued board tokens", async () => {
+    const stubs = discoveryStubs({ installed: false });
+    const { impl: execFileImpl } = execFileStub((done) => done(null, { stdout: "", stderr: "" }));
+    const namespace = await loadCanvasServer({ execFileImpl, ...stubs });
+    let closed = 0;
+    const canvas = await startCanvas(namespace, {
+        closeBoard: async () => {
+            closed += 1;
+        },
+    });
+    canvas.entry.featureFlags.boards = true;
+    canvas.entry.boards.set("issued-token", { url: "http://127.0.0.1:9/", key: "example/project/board" });
+
+    try {
+        const response = await fetch(`${canvas.base}/api/feature-flags`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-Canvas-Nonce": canvas.apiNonce,
+            },
+            body: JSON.stringify({ boards: false }),
+        });
+
+        assert.equal(response.status, 200);
+        assert.equal((await response.json()).featureFlags.boards, false);
+        assert.equal(canvas.entry.boards.size, 0);
+        assert.equal(closed, 1);
+        assert.equal((await fetch(`${canvas.base}/boards/issued-token/`)).status, 404);
+    } finally {
+        await canvas.entry.closeBoards();
+        canvas.close();
+    }
+});
+
+test("each opened board is proxied under its own canvas path", async () => {
+    const requests = [];
+    const boardServer = createServer(async (req, res) => {
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        requests.push({
+            method: req.method,
+            url: req.url,
+            nonce: req.headers["x-canvas-nonce"],
+            body: Buffer.concat(chunks).toString("utf8"),
+        });
+        if (req.url === "/") {
+            res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+            res.end("<!doctype html><title>Board</title>");
+            return;
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+    });
+    await new Promise((resolve) => boardServer.listen(0, "127.0.0.1", resolve));
+    const address = boardServer.address();
+    const boardUrl = `http://127.0.0.1:${address.port}/`;
+    const stubs = discoveryStubs({ installed: false });
+    const { impl: execFileImpl } = execFileStub((done) => done(null, { stdout: "", stderr: "" }));
+    const namespace = await loadCanvasServer({ execFileImpl, ...stubs });
+    const canvas = await startCanvas(namespace);
+    canvas.entry.boards.set("favorite-one", { url: boardUrl, key: "example/project/favorite-one", apiNonce: "board-secret" });
+    canvas.entry.boards.set("credentialed", { url: boardUrl.replace("http://", "http://user:password@"), apiNonce: "board-secret" });
+
+    try {
+        assert.equal(canvas.config.boardPath, undefined);
+        const documentResponse = await fetch(`${canvas.base}/boards/favorite-one/`);
+        assert.equal(documentResponse.status, 200);
+        assert.match(await documentResponse.text(), /<title>Board<\/title>/);
+        const credentialedBoard = await fetch(`${canvas.base}/boards/credentialed/`);
+        assert.equal(credentialedBoard.status, 404);
+
+        const reboundResponse = await new Promise((resolve, reject) => {
+            const req = request(`${canvas.base}/boards/favorite-one/`, {
+                headers: { Host: "attacker.example" },
+            }, (res) => {
+                const chunks = [];
+                res.on("data", (chunk) => chunks.push(chunk));
+                res.on("end", () => resolve({
+                    status: res.statusCode,
+                    json: () => JSON.parse(Buffer.concat(chunks).toString("utf8")),
+                }));
+            });
+            req.on("error", reject);
+            req.end();
+        });
+        assert.equal(reboundResponse.status, 400);
+        assert.equal(reboundResponse.json().message, "Rejected request with unexpected Host header.");
+
+        const missingNonce = await fetch(`${canvas.base}/boards/favorite-one/state`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ id: 42, state: "Doing" }),
+        });
+        assert.equal(missingNonce.status, 400);
+
+        const queryResponse = await fetch(`${canvas.base}/boards/favorite-one/state?unexpected=1`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-Canvas-Nonce": "board-secret",
+            },
+            body: JSON.stringify({ id: 42, state: "Doing" }),
+        });
+        assert.equal(queryResponse.status, 404);
+
+        const stateResponse = await fetch(`${canvas.base}/boards/favorite-one/state`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-Canvas-Nonce": "board-secret",
+            },
+            body: JSON.stringify({ id: 42, state: "Doing" }),
+        });
+        assert.equal(stateResponse.status, 200);
+        const refreshResponse = await fetch(`${canvas.base}/boards/favorite-one/refresh`, {
+            method: "POST",
+            headers: { "X-Canvas-Nonce": "board-secret" },
+        });
+        assert.equal(refreshResponse.status, 200);
+        const iconResponse = await fetch(`${canvas.base}/boards/favorite-one/type-icons.json`, {
+            headers: { "X-Canvas-Nonce": "board-secret" },
+        });
+        assert.equal(iconResponse.status, 200);
+        const localConfigResponse = await fetch(`${canvas.base}/boards/favorite-one/local-config`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-Canvas-Nonce": "board-secret",
+            },
+            body: JSON.stringify({ localProject: "Azure DevOps Extension" }),
+        });
+        assert.equal(localConfigResponse.status, 200);
+        const invalidItemResponse = await fetch(`${canvas.base}/boards/favorite-one/item/history`);
+        assert.equal(invalidItemResponse.status, 404);
+        const baseUrl = new URL(canvas.base);
+        const traversalResponse = await new Promise((resolve, reject) => {
+            const req = request({
+                hostname: baseUrl.hostname,
+                port: baseUrl.port,
+                path: "/boards/favorite-one/item/../refresh",
+            }, (res) => {
+                res.resume();
+                res.on("end", () => resolve(res));
+            });
+            req.on("error", reject);
+            req.end();
+        });
+        assert.equal(traversalResponse.statusCode, 404);
+        assert.deepEqual(requests, [
+            { method: "GET", url: "/", nonce: undefined, body: "" },
+            {
+                method: "POST",
+                url: "/state",
+                nonce: "board-secret",
+                body: JSON.stringify({ id: 42, state: "Doing" }),
+            },
+            { method: "POST", url: "/refresh", nonce: "board-secret", body: "" },
+            { method: "GET", url: "/type-icons.json", nonce: "board-secret", body: "" },
+            {
+                method: "POST",
+                url: "/local-config",
+                nonce: "board-secret",
+                body: JSON.stringify({ localProject: "Azure DevOps Extension" }),
+            },
+        ]);
+    } finally {
+        canvas.close();
+        await new Promise((resolve) => boardServer.close(resolve));
+    }
+});
+
+test("favorite boards are read with the canvas authentication and scoped to its project", async () => {
+    const requests = [];
+    const fetchImpl = async (url, options = {}) => {
+        requests.push({ url: String(url), authorization: options.headers?.Authorization || "" });
+        return new Response(JSON.stringify({
+            value: [
+                {
+                    id: "favorite-stories",
+                    artifactName: "Stories board",
+                    artifactType: "Microsoft.TeamFoundation.Work.TeamBoardSets",
+                    artifactScope: { type: "Project", name: "Project" },
+                    _links: {
+                        page: {
+                            href: "/example/Project/_boards/board/t/Web%20Team",
+                        },
+                    },
+                },
+                {
+                    id: "favorite-other",
+                    artifactName: "Other project",
+                    artifactType: "Microsoft.TeamFoundation.Work.WebAccess.Board",
+                    artifactScope: { type: "Project", name: "Other" },
+                    _links: {
+                        page: {
+                            href: "https://dev.azure.com/example/Other/_boards/board/t/Other%20Team/Stories",
+                        },
+                    },
+                },
+                {
+                    id: "favorite-other-org",
+                    artifactName: "Other organization",
+                    artifactType: "Microsoft.TeamFoundation.Work.WebAccess.Board",
+                    artifactScope: { type: "Project", name: "Project" },
+                    _links: {
+                        page: {
+                            href: "https://dev.azure.com/different/Project/_boards/board/t/Web%20Team/Stories",
+                        },
+                    },
+                },
+                {
+                    id: "favorite-malformed",
+                    artifactName: "Malformed favorite",
+                    artifactType: "Microsoft.TeamFoundation.Work.TeamBoardSets",
+                    artifactScope: { type: "Project", name: "Project" },
+                    _links: {
+                        page: {
+                            href: "/example/Project/_boards/board/t/Bad%ZZTeam",
+                        },
+                    },
+                },
+            ],
+        }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        });
+    };
+    const stubs = discoveryStubs({ installed: true });
+    const { impl: execFileImpl } = execFileStub((done) => done(null, { stdout: "canvas-token\n", stderr: "" }));
+    const namespace = await loadCanvasServer({ execFileImpl, fetchImpl, ...stubs });
+    const canvas = await startCanvas(namespace);
+
+    try {
+        await canvas.startAgencyAuthWithin(5000);
+        const auth = await waitForAuthProcess(canvas);
+        assert.equal(auth.auth.isAuthenticated, true);
+        const result = await namespace.listFavoriteBoards({
+            organization: "example",
+            project: "Project",
+        });
+
+        assert.deepEqual(JSON.parse(JSON.stringify(result)), {
+            boards: [{
+                id: "favorite-stories",
+                artifactId: "",
+                name: "Stories board",
+                organization: "example",
+                project: "Project",
+                team: "Web Team",
+                boardId: "",
+                backlogLevel: "",
+                url: "https://dev.azure.com/example/Project/_boards/board/t/Web%20Team",
+            }],
+            count: 1,
+            otherProjectBoardCount: 0,
+            requiresProject: false,
+        });
+        assert.equal(requests.length, 1);
+    assert.match(requests[0].url, /artifactType=Microsoft\.TeamFoundation\.Work\.TeamBoardSets/);
+    assert.equal(requests[0].authorization, "Bearer canvas-token");
+    } finally {
+        canvas.close();
+    }
+});
+
+test("favorite board discovery falls back to URL-verified project favorites", async () => {
+    const requests = [];
+    const fetchImpl = async (url, options = {}) => {
+        const parsed = new URL(url);
+        const headers = new Headers(options.headers || {});
+        requests.push({
+            artifactType: parsed.searchParams.get("artifactType") || "",
+            hasBearer: headers.get("authorization")?.startsWith("Bearer ") || false,
+        });
+        const value = parsed.searchParams.has("artifactType")
+            ? []
+            : [{
+                id: "favorite-stories",
+                artifactName: "Stories board",
+                artifactScope: { type: "Project", name: "Project" },
+                _links: {
+                    page: {
+                        href: "https://dev.azure.com/example/Project/_boards/board/t/Web%20Team/Stories",
+                    },
+                },
+            }];
+        return new Response(JSON.stringify({ value }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        });
+    };
+    const stubs = discoveryStubs({ installed: true });
+    const { impl: execFileImpl } = execFileStub((done) => done(null, { stdout: "canvas-token\n", stderr: "" }));
+    const namespace = await loadCanvasServer({ execFileImpl, fetchImpl, ...stubs });
+    const canvas = await startCanvas(namespace);
+
+    try {
+        await canvas.startAgencyAuthWithin(5000);
+        const auth = await waitForAuthProcess(canvas);
+        assert.equal(auth.auth.isAuthenticated, true);
+        const result = await namespace.listFavoriteBoards({
+            organization: "example",
+            project: "Project",
+        });
+        assert.equal(result.count, 1);
+        assert.equal(result.boards[0].name, "Stories board");
+        assert.deepEqual(requests, [
+            { artifactType: "Microsoft.TeamFoundation.Work.TeamBoardSets", hasBearer: true },
+            { artifactType: "", hasBearer: true },
+        ]);
+    } finally {
+        canvas.close();
+    }
+});
+
+test("opening a favorite board supplies a REST provider backed by the canvas connection", async () => {
+    const requests = [];
+    const boardIds = Array.from({ length: 201 }, (_, index) => index + 1);
+    const fetchImpl = async (url, options = {}) => {
+        const parsed = new URL(url);
+        const headers = new Headers(options.headers || {});
+        requests.push({
+            path: parsed.pathname,
+            method: options.method || "GET",
+            authorization: headers.get("authorization") || "",
+            body: options.body || "",
+        });
+        if (parsed.pathname.endsWith("/_apis/favorite/favorites")) {
+            return new Response(JSON.stringify({
+                value: [{
+                    id: "favorite-stories",
+                    artifactName: "Stories board",
+                    artifactScope: { type: "Project", name: "Project" },
+                    _links: {
+                        page: {
+                            href: "/example/Project/_boards/board/t/Web%20Team",
+                        },
+                    },
+                }],
+            }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (parsed.pathname.endsWith("/_apis/work/boards")) {
+            return new Response(JSON.stringify({
+                value: [
+                    { id: "epics-board", name: "Epics" },
+                    { id: "history-board", name: "History" },
+                    { id: "stories-board", name: "Product Backlog" },
+                    { id: "features-board", name: "Features" },
+                ],
+            }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (parsed.pathname.endsWith("/_apis/work/boards/stories-board")) {
+            return new Response(JSON.stringify({
+                columns: [{
+                    name: "Active",
+                    columnType: "inProgress",
+                    stateMappings: { "User Story": "Active" },
+                }],
+            }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (parsed.pathname.endsWith("/_apis/wit/workitemtypes")) {
+            return new Response(JSON.stringify({
+                value: [{
+                    name: "User Story",
+                    color: "009CCC",
+                    icon: { id: "icon_book", url: "https://example.invalid/icon" },
+                }],
+            }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (parsed.pathname.endsWith("/_apis/wit/workItemIcons/icon_book")) {
+            return new Response("<svg viewBox=\"0 0 16 16\"><path d=\"M1 1h14v14H1z\"/></svg>", {
+                status: 200,
+                headers: { "Content-Type": "image/svg+xml" },
+            });
+        }
+        if (parsed.pathname.includes("/_apis/work/backlogs/")) {
+            return new Response(JSON.stringify({
+                workItems: parsed.pathname.includes("Microsoft.RequirementCategory")
+                    ? boardIds.map((id) => ({ target: { id } }))
+                    : [],
+            }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (parsed.pathname.endsWith("/_apis/wit/workitemsbatch")) {
+            const ids = JSON.parse(options.body).ids;
+            return new Response(JSON.stringify({
+                value: ids.map((id) => ({
+                    id,
+                    fields: {
+                        "System.Title": "Use shared authentication",
+                        "System.State": "Active",
+                        "System.WorkItemType": "User Story",
+                    },
+                })),
+            }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        throw new Error(`Unexpected Azure DevOps request: ${parsed.pathname}`);
+    };
+    const stubs = discoveryStubs({ installed: true });
+    const { impl: execFileImpl } = execFileStub((done) => done(null, { stdout: "canvas-token\n", stderr: "" }));
+    const namespace = await loadCanvasServer({ execFileImpl, fetchImpl, ...stubs });
+    let opened;
+    let closed = 0;
+    const canvas = await startCanvas(namespace, {
+        openBoard: async (input) => {
+            opened = input;
+            return { url: "http://127.0.0.1:9/", instanceId: "managed-board" };
+        },
+        closeBoard: async () => {
+            closed += 1;
+        },
+    });
+    canvas.entry.input = { organization: "example", project: "Project" };
+    canvas.entry.featureFlags.boards = true;
+
+    try {
+        await canvas.startAgencyAuthWithin(5000);
+        const auth = await waitForAuthProcess(canvas);
+        assert.equal(auth.auth.isAuthenticated, true);
+        const response = await fetch(`${canvas.base}/api/boards/open`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-Canvas-Nonce": canvas.apiNonce,
+            },
+            body: JSON.stringify({
+                id: "favorite-stories",
+                organization: "example",
+                project: "Project",
+            }),
+        });
+        assert.equal(response.status, 200);
+        assert.match((await response.json()).path, /^\/boards\/[A-Za-z0-9_-]+\/$/);
+        assert.equal(opened.board.name, "Stories board");
+        assert.equal(opened.connection.organization, "example");
+        assert.match(opened.pathPrefix, /^\/boards\/[A-Za-z0-9_-]+$/);
+
+        const result = await opened.dataProvider.fetchAllItems();
+        assert.equal(result.items.length, 201);
+        assert.equal(result.items[0].id, 1);
+        assert.equal(result.items.at(-1).id, 201);
+        assert.deepEqual(JSON.parse(JSON.stringify(result.columns)), [{
+            name: "Active",
+            mappings: { "User Story": "Active" },
+            columnType: "inProgress",
+        }]);
+        assert.deepEqual(await opened.dataProvider.fetchWorkItemTypeIcons(["User Story", "Task"]), {
+            "User Story": "data:image/svg+xml;base64,PHN2ZyB2aWV3Qm94PSIwIDAgMTYgMTYiPjxwYXRoIGQ9Ik0xIDFoMTR2MTRIMXoiLz48L3N2Zz4=",
+        });
+        assert.ok(requests.some((entry) => entry.path.endsWith("/_apis/work/boards")));
+        assert.ok(requests.some((entry) => entry.path.endsWith("/_apis/work/boards/stories-board")));
+        assert.equal(requests.filter((entry) => entry.path.includes("/_apis/work/backlogs/")).length, 4);
+        assert.ok(requests.some((entry) => entry.path.endsWith("/_apis/wit/workItemIcons/icon_book")));
+        assert.deepEqual(
+            requests
+                .filter((entry) => entry.path.endsWith("/_apis/wit/workitemsbatch"))
+                .map((entry) => JSON.parse(entry.body).ids.length),
+            [200, 1],
+        );
+        assert.ok(
+            requests.every((entry) => entry.authorization.startsWith("Bearer ")),
+            JSON.stringify(requests.map((entry) => ({
+                path: entry.path,
+                hasBearer: entry.authorization.startsWith("Bearer "),
+                length: entry.authorization.length,
+            }))),
+        );
+
+        await canvas.entry.closeBoards();
+        assert.equal(closed, 1);
+    } finally {
+        await canvas.entry.closeBoards();
+        canvas.close();
+    }
+});
+
 async function waitForAuthProcess(canvas) {
     let status;
     for (let attempt = 0; attempt < 40; attempt += 1) {
@@ -202,6 +745,130 @@ async function waitForAuthProcess(canvas) {
     }
     assert.fail("authentication process did not reach a terminal state");
 }
+
+async function microsoftCallbackFailure(t, tokenFetch) {
+    const stubs = discoveryStubs({ installed: false });
+    t.after(() => rmSync(stubs.home, { recursive: true, force: true }));
+    const { impl: execFileImpl } = execFileStub(() => assert.fail("unexpected AzureAuth request"));
+    let tokenRequests = 0;
+    const namespace = await loadCanvasServer({
+        ...stubs,
+        execFileImpl,
+        fetchImpl: async (url, options) => {
+            assert.equal(url, "https://login.microsoftonline.com/common/oauth2/v2.0/token");
+            assert.equal(options.method, "POST");
+            assert.equal(options.body.get("grant_type"), "authorization_code");
+            assert.equal(options.body.get("code"), "fictional-code");
+            assert.ok(options.body.get("code_verifier"));
+            tokenRequests += 1;
+            return tokenFetch(options);
+        },
+    });
+    const canvas = await startCanvas(namespace);
+    t.after(() => canvas.close());
+    const logs = [];
+    let callbackStatus;
+    let terminal;
+    // Exercise the UI's actual startAuth log consumer without a browser or DOM.
+    const appSource = await readFile(new URL("./ui/app.mjs", import.meta.url), "utf8");
+    const startAuthSource = appSource.slice(appSource.indexOf("async function startAuth("), appSource.indexOf("\nasync function signOut("));
+    const ui = new SourceTextModule(`${startAuthSource}\nexport { startAuth };`, {
+        context: createContext({
+            signInMicrosoftButton: {},
+            signInAgencyButton: {},
+            renderAuthOutput() {},
+            addLog: (level, message, details = "") => logs.push({ level, message, details }),
+            request: async (path, options) => {
+                const response = await fetch(`${canvas.base}${path}`, {
+                    ...options,
+                    headers: { ...options.headers, "x-canvas-nonce": canvas.apiNonce },
+                });
+                assert.equal(response.status, 200);
+                const data = await response.json();
+                const authorize = new URL(data.authProcess.authorizationUrl);
+                const callback = new URL(authorize.searchParams.get("redirect_uri"));
+                callback.searchParams.set("state", authorize.searchParams.get("state"));
+                callback.searchParams.set("code", "fictional-code");
+                const result = await fetch(callback);
+                callbackStatus = result.status;
+                assert.match(await result.text(), /Sign-in failed/);
+                return data;
+            },
+            waitForAuthentication: async () => {
+                terminal = await waitForAuthProcess(canvas);
+                return terminal;
+            },
+        }),
+    });
+    await ui.link(() => assert.fail("unexpected UI import"));
+    await ui.evaluate();
+    await ui.namespace.startAuth("microsoft");
+    // The callback can finish before /auth/start's response is read.
+    terminal ??= await waitForAuthProcess(canvas);
+    assert.equal(callbackStatus, 400);
+    assert.equal(tokenRequests, 1);
+    assert.equal(terminal.auth.isAuthenticated, false);
+    assert.equal(terminal.authProcess.provider, "microsoft");
+    assert.equal(terminal.authProcess.status, "failed");
+    assert.ok(terminal.authProcess.completedAt);
+    const log = logs.find((entry) => entry.level === "error");
+    assert.equal(log?.message, "Microsoft sign-in did not complete successfully.");
+    assert.equal(log.details, terminal.authProcess.output);
+    return { process: terminal.authProcess, log };
+}
+
+test("Microsoft OAuth callback retains the safe fetch cause in status and canvas logs", async (t) => {
+    const tokenServer = createServer((req) => req.socket.destroy());
+    await new Promise((resolve) => tokenServer.listen(0, "127.0.0.1", resolve));
+    t.after(() => {
+        tokenServer.closeAllConnections();
+        tokenServer.close();
+    });
+    let fetchError;
+    const result = await microsoftCallbackFailure(t, async (options) => {
+        try {
+            return await fetch(`http://127.0.0.1:${tokenServer.address().port}/token`, options);
+        } catch (error) {
+            fetchError = error;
+            throw error;
+        }
+    });
+    assert.equal(fetchError.name, "TypeError");
+    assert.equal(fetchError.message, "fetch failed");
+    assert.equal(fetchError.cause.code, "UND_ERR_SOCKET");
+    t.diagnostic(JSON.stringify({
+        nativeError: { name: fetchError.name, message: fetchError.message, causeCode: fetchError.cause.code },
+        authProcess: { status: result.process.status, output: result.process.output, error: result.process.error },
+        canvasLog: result.log,
+    }));
+    assert.equal(result.process.output, "fetch failed (UND_ERR_SOCKET)");
+    assert.equal(result.process.error.message, result.process.output);
+});
+
+test("Microsoft OAuth callback exposes only bounded cause identifiers", async (t) => {
+    const privateDetail = "https://proxy.invalid/token?code=fictional-secret";
+    for (const [label, cause, expected] of [
+        ["certificate code", { code: "UNABLE_TO_VERIFY_LEAF_SIGNATURE", message: privateDetail }, "fetch failed (UNABLE_TO_VERIFY_LEAF_SIGNATURE)"],
+        ["socket code", { code: "ECONNRESET", message: privateDetail }, "fetch failed (ECONNRESET)"],
+        ["no cause", undefined, "fetch failed"],
+        ["missing code", { message: privateDetail }, "fetch failed"],
+        ["URL code", { code: privateDetail, message: privateDetail }, "fetch failed"],
+        ["multiline code", { code: "UND_ERR_SOCKET\nPRIVATE_DETAIL", message: privateDetail }, "fetch failed"],
+        ["non-string code", { code: 123, message: privateDetail }, "fetch failed"],
+        ["overlong code", { code: "A".repeat(65), message: privateDetail }, "fetch failed"],
+        ["nested cause", { cause: { code: "ECONNRESET" }, message: privateDetail }, "fetch failed"],
+    ]) {
+        await t.test(label, async (t) => {
+            const { process, log } = await microsoftCallbackFailure(t, () => {
+                throw new TypeError("fetch failed", { cause });
+            });
+            assert.equal(process.output, expected);
+            assert.deepEqual(process.error, { error: "azure_devops_unexpected_error", message: expected });
+            assert.equal(log.details, expected);
+            assert.ok(!JSON.stringify({ process, log }).includes(privateDetail));
+        });
+    }
+});
 
 test("avatar URLs are restricted to the configured Azure DevOps organization", async () => {
     const { homedirImpl, existsSyncImpl, readdirSyncImpl } = discoveryStubs({ installed: false });
@@ -424,7 +1091,8 @@ test("pull request work items retain link order across API batches", async () =>
                     id: 800,
                     pipeline: "Canvas CI",
                     name: "20260810.8",
-                    status: "succeeded",
+                    status: "completed",
+                    result: "succeeded",
                     changedDate: "2026-08-10T18:30:00Z",
                     webUrl: "https://dev.azure.com/fabrikam/Project/_build/results?buildId=800",
                 },
@@ -433,6 +1101,7 @@ test("pull request work items retain link order across API batches", async () =>
                     pipeline: "Extension validation",
                     name: "20260810.7",
                     status: "inProgress",
+                    result: "",
                     changedDate: "",
                     webUrl: "https://dev.azure.com/fabrikam/Project/_build/results?buildId=700",
                 },
@@ -1711,7 +2380,7 @@ test("a caller cannot label an HTML field as Markdown to bypass validation", asy
 // A signed-in canvas whose workspace has no Azure DevOps remote. The git stub
 // answers `git remote -v` with nothing, which is what a GitHub checkout or a
 // bare directory looks like to the detector.
-async function connectionCanvas({ routes = {}, home } = {}) {
+async function connectionCanvas({ routes = {}, home, serverOptions = {} } = {}) {
     // The home is a parameter so two canvases can share one, which is how a
     // reload is simulated: the second reads the connection the first wrote.
     const stubs = discoveryStubs({ installed: true, ...(home ? { home } : {}) });
@@ -1726,13 +2395,16 @@ async function connectionCanvas({ routes = {}, home } = {}) {
             requests.push({ pathname: parsed.pathname, search: parsed.search, body: options?.body });
             for (const [suffix, handler] of Object.entries(routes)) {
                 if (parsed.pathname.endsWith(suffix)) {
-                    return new Response(JSON.stringify(typeof handler === "function" ? handler(parsed, options) : handler), { status: 200 });
+                    const result = typeof handler === "function" ? handler(parsed, options) : handler;
+                    return result instanceof Response
+                        ? result
+                        : new Response(JSON.stringify(result), { status: 200 });
                 }
             }
             throw new Error(`Unexpected Azure DevOps request: ${parsed.pathname}`);
         },
     });
-    const canvas = await startCanvas(namespace);
+    const canvas = await startCanvas(namespace, serverOptions);
     return { namespace, canvas, requests, home: stubs.home };
 }
 
@@ -1897,6 +2569,276 @@ test("repositories are listed across the organization when no project is chosen"
     }
 });
 
+// A token Azure DevOps cannot validate is not an error to it: unless asked to
+// suppress the redirect, it sends the request to the VSSPS sign-in page and the
+// chain ends in a 2xx HTML page. These tests sign the canvas in through the real
+// browser OAuth loopback and answer every Azure DevOps request with `respond`.
+const REJECTED_TOKEN_CLAIMS = {
+    tid: "11111111-2222-3333-4444-555555555555",
+    iss: "https://sts.windows.net/11111111-2222-3333-4444-555555555555/",
+    idtyp: "user",
+    exp: Math.floor(Date.now() / 1000) + 3600,
+};
+const REJECTED_TOKEN = [
+    Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url"),
+    Buffer.from(JSON.stringify(REJECTED_TOKEN_CLAIMS)).toString("base64url"),
+    "signature",
+].join(".");
+
+async function rejectionCanvas(respond) {
+    const stubs = discoveryStubs({ installed: false });
+    const { impl: execFileImpl } = execFileStub((done) => done(new Error("AzureAuth is not used by these tests")));
+    const requests = [];
+    const logs = [];
+    const namespace = await loadCanvasServer({
+        execFileImpl,
+        ...stubs,
+        fetchImpl: async (url, options = {}) => {
+            const parsed = new URL(url);
+            if (parsed.host === "login.microsoftonline.com" && parsed.pathname.endsWith("/token")) {
+                return new Response(JSON.stringify({ access_token: REJECTED_TOKEN, refresh_token: "refresh", expires_in: 3600 }), { status: 200 });
+            }
+            requests.push({ host: parsed.host, pathname: parsed.pathname, headers: { ...(options.headers || {}) } });
+            return respond(parsed, options);
+        },
+    });
+    const canvas = await startCanvas(namespace);
+    namespace.setCopilotSession({
+        workspacePath: tmpdir(),
+        rpc: { mcp: { list: async () => [] }, metadata: { snapshot: async () => ({}) } },
+        log: async (message) => { logs.push(message); },
+    });
+    const started = await authed(canvas, "/api/auth/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: "microsoft" }),
+    }).then((res) => res.json());
+    const authorizeUrl = new URL(started.authProcess.authorizationUrl);
+    const callback = new URL(started.authProcess.redirectUri);
+    callback.searchParams.set("code", "authorization-code");
+    callback.searchParams.set("state", authorizeUrl.searchParams.get("state"));
+    await fetch(callback).then((res) => res.text());
+    const settled = await canvas.authStatus();
+    assert.equal(settled.auth?.isAuthenticated, true, "the canvas starts signed in");
+    assert.equal(settled.auth?.authType, "microsoft");
+    return { namespace, canvas, requests, logs };
+}
+
+function signInPageResponse() {
+    const response = new Response("<!DOCTYPE html><html><head><title>Azure DevOps Services | Sign In</title></head><body></body></html>", {
+        status: 203,
+        headers: { "Content-Type": "text/html; charset=utf-8", "x-vss-resourcetenant": "99999999-8888-7777-6666-555555555555" },
+    });
+    Object.defineProperty(response, "redirected", { value: true });
+    Object.defineProperty(response, "url", { value: "https://fabrikam.vssps.visualstudio.com/_signin?realm=dev.azure.com" });
+    return response;
+}
+
+function jsonStatusResponse(status, body, headers = {}) {
+    return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...headers } });
+}
+
+test("an anonymous sign-in page is reported as a rejected sign-in, not as an empty project list", async () => {
+    const { canvas, logs } = await rejectionCanvas(() => signInPageResponse());
+    try {
+        const response = await authed(canvas, "/api/projects?organization=fabrikam");
+        const body = await response.json();
+        assert.equal(response.status, 400);
+        assert.equal(body.error, "azure_devops_authentication_rejected");
+        assert.equal(body.projects, undefined, "no success-shaped project list is returned");
+
+        const status = await canvas.authStatus();
+        assert.equal(status.auth.isAuthenticated, false, "the rejected token is dropped so the UI asks to sign in again");
+
+        const diagnostic = logs.find((line) => line.includes(REJECTED_TOKEN_CLAIMS.tid));
+        assert.ok(diagnostic, "the rejection is logged with the token tenant");
+        assert.match(diagnostic, /browser-oauth/);
+        assert.ok(diagnostic.includes(REJECTED_TOKEN_CLAIMS.iss));
+        assert.ok(diagnostic.includes("idtyp=user"));
+        assert.ok(diagnostic.includes("99999999-8888-7777-6666-555555555555"), "the resource tenant header is logged");
+        assert.ok(logs.every((line) => !line.includes(REJECTED_TOKEN)), "the token itself is never logged");
+    } finally {
+        canvas.close();
+    }
+});
+
+test("a 401 from Azure DevOps is reported as a rejected sign-in and signs the canvas out", async () => {
+    const { canvas } = await rejectionCanvas(() => jsonStatusResponse(401, {
+        message: "TF400813: The user '' is not authorized to access this resource.",
+    }));
+    try {
+        const response = await authed(canvas, "/api/projects?organization=fabrikam");
+        assert.equal((await response.json()).error, "azure_devops_authentication_rejected");
+        assert.equal((await canvas.authStatus()).auth.isAuthenticated, false);
+    } finally {
+        canvas.close();
+    }
+});
+
+test("a successful HTML response without redirect metadata is still a rejected sign-in", async () => {
+    const { canvas } = await rejectionCanvas(() => new Response("<html>Sign in</html>", {
+        headers: { "Content-Type": "text/html" },
+    }));
+    try {
+        const response = await authed(canvas, "/api/projects?organization=fabrikam");
+        assert.equal(response.status, 400);
+        assert.equal((await response.json()).error, "azure_devops_authentication_rejected");
+        assert.equal((await canvas.authStatus()).auth.isAuthenticated, false);
+    } finally {
+        canvas.close();
+    }
+});
+
+test("a rejected Agency token is dropped without deleting the sign-in preference", async () => {
+    const stubs = discoveryStubs({ installed: true });
+    writeMarker(stubs.markerPath);
+    const { impl: execFileImpl } = execFileStub((done) => done(null, { stdout: "test-access-token", stderr: "" }));
+    const namespace = await loadCanvasServer({
+        ...stubs,
+        execFileImpl,
+        fetchImpl: async () => jsonStatusResponse(401, { message: "Sign in again." }),
+    });
+    const canvas = await startCanvas(namespace);
+    try {
+        assert.equal((await waitForAuthProcess(canvas)).auth.authType, "azureauth");
+        const response = await authed(canvas, "/api/projects?organization=fabrikam");
+        assert.equal((await response.json()).error, "azure_devops_authentication_rejected");
+        assert.equal((await canvas.authStatus()).auth.isAuthenticated, false);
+        assert.equal(existsSync(stubs.markerPath), true);
+    } finally {
+        canvas.close();
+        rmSync(stubs.home, { recursive: true, force: true });
+    }
+});
+
+test("a delayed rejection does not discard a newer Microsoft token", async () => {
+    const stubs = discoveryStubs({ installed: false });
+    const { impl: execFileImpl } = execFileStub(() => assert.fail("unexpected AzureAuth request"));
+    let releaseResponse;
+    let started;
+    const requestStarted = new Promise((resolve) => { started = resolve; });
+    const namespace = await loadCanvasServer({
+        ...stubs,
+        execFileImpl,
+        browserTokenForTest: { access_token: "older-test-token", expires_in: 3600 },
+        fetchImpl: () => new Promise((resolve) => {
+            releaseResponse = resolve;
+            started();
+        }),
+    });
+    const canvas = await startCanvas(namespace);
+    try {
+        const response = authed(canvas, "/api/projects?organization=fabrikam");
+        await requestStarted;
+        await namespace.seedBrowserTokenForTest({ access_token: "newer-test-token", expires_in: 3600 });
+        releaseResponse(jsonStatusResponse(401, { message: "Sign in again." }));
+        assert.equal((await (await response).json()).error, "azure_devops_authentication_rejected");
+        assert.equal((await canvas.authStatus()).auth.isAuthenticated, true);
+    } finally {
+        canvas.close();
+        rmSync(stubs.home, { recursive: true, force: true });
+    }
+});
+
+test("an organization list answered by the sign-in page also signs the canvas out", async () => {
+    const { namespace, canvas } = await rejectionCanvas(() => signInPageResponse());
+    try {
+        await assert.rejects(namespace.listOrganizations(), { code: "azure_devops_authentication_rejected" });
+        assert.equal((await canvas.authStatus()).auth.isAuthenticated, false);
+    } finally {
+        canvas.close();
+    }
+});
+
+test("Home propagates a rejected sign-in instead of returning successful section errors", async () => {
+    const { canvas } = await rejectionCanvas(() => jsonStatusResponse(401, { message: "Sign in again." }));
+    try {
+        await authed(canvas, "/api/connection", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ organization: "fabrikam" }),
+        });
+        const response = await authed(canvas, "/api/home");
+        assert.equal(response.status, 400);
+        const body = await response.json();
+        assert.equal(body.error, "azure_devops_authentication_rejected");
+        assert.equal(body.connections, undefined);
+        assert.equal((await canvas.authStatus()).auth.isAuthenticated, false);
+    } finally {
+        canvas.close();
+    }
+});
+
+test("Home preserves partial results and sign-in for an ordinary permission failure", async () => {
+    const { canvas } = await rejectionCanvas(() => jsonStatusResponse(403, { message: "Permission denied." }));
+    try {
+        await authed(canvas, "/api/connection", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ organization: "fabrikam" }),
+        });
+        const response = await authed(canvas, "/api/home");
+        assert.equal(response.status, 200);
+        const body = await response.json();
+        assert.equal(body.connections.length, 1);
+        assert.match(body.connections[0].myWorkItems.error, /403 Permission denied/);
+        assert.equal(body.connections[0].myPullRequests.requiresProject, true);
+        assert.equal((await canvas.authStatus()).auth.isAuthenticated, true);
+    } finally {
+        canvas.close();
+    }
+});
+
+test("Azure DevOps requests ask for a 401 instead of a sign-in redirect", async () => {
+    const { namespace, canvas, requests } = await rejectionCanvas((url) => (url.pathname.endsWith("/_apis/profile/profiles/me")
+        ? jsonStatusResponse(200, { id: "member-1" })
+        : jsonStatusResponse(200, { value: [{ id: "p1", name: "Contoso" }] })));
+    try {
+        const projects = await authed(canvas, "/api/projects?organization=fabrikam").then((res) => res.json());
+        assert.deepEqual(projects.projects, [{ id: "p1", name: "Contoso" }]);
+        await namespace.listOrganizations();
+        assert.ok(requests.some((request) => request.host === "dev.azure.com"));
+        assert.ok(requests.some((request) => request.host === "app.vssps.visualstudio.com"));
+        for (const request of requests) {
+            assert.equal(request.headers["X-TFS-FedAuthRedirect"], "Suppress", `${request.host}${request.pathname} suppresses the redirect`);
+        }
+    } finally {
+        canvas.close();
+    }
+});
+
+// Azure DevOps also answers 401 when a valid sign-in is not a member of the
+// organization. Those responses name the caller in x-vss-userdata.
+test("a 401 for a signed-in user outside the organization keeps the canvas signed in", async () => {
+    const { canvas } = await rejectionCanvas(() => jsonStatusResponse(401, {
+        message: "TF400813: The user '00000000-0000-0000-0000-000000000001' is not authorized to access this resource.",
+    }, { "x-vss-userdata": "00000000-0000-0000-0000-000000000001:user@fabrikam.example" }));
+    try {
+        const response = await authed(canvas, "/api/projects?organization=fabrikam");
+        const body = await response.json();
+        assert.equal(body.error, "azure_devops_request_failed");
+        assert.match(body.message, /^401 TF400813/);
+        assert.equal((await canvas.authStatus()).auth.isAuthenticated, true);
+    } finally {
+        canvas.close();
+    }
+});
+
+test("a 403 from Azure DevOps stays a request failure and keeps the canvas signed in", async () => {
+    const { canvas } = await rejectionCanvas(() => jsonStatusResponse(403, {
+        message: "TF400813: The user is not authorized to access this resource.",
+    }));
+    try {
+        const response = await authed(canvas, "/api/projects?organization=fabrikam");
+        const body = await response.json();
+        assert.equal(body.error, "azure_devops_request_failed");
+        assert.match(body.message, /^403 TF400813/);
+        assert.equal((await canvas.authStatus()).auth.isAuthenticated, true);
+    } finally {
+        canvas.close();
+    }
+});
+
 test("a connection without a project queries work items across the organization", async () => {
     const { namespace, canvas, requests } = await connectionCanvas({
         routes: {
@@ -1955,6 +2897,13 @@ test("a project whose type definitions cannot be read keeps its items rather tha
         },
     });
     const canvas = await startCanvas(namespace);
+    namespace.setCopilotSession({
+        workspacePath: tmpdir(),
+        rpc: { mcp: { list: async () => [] }, metadata: { snapshot: async () => ({}) } },
+        log: async () => {
+            throw new Error("logging unavailable");
+        },
+    });
     try {
         const result = await namespace.queryMyOpenWorkItems({ organization: "fabrikam" });
         assert.equal(result.workItems.length, 1, "showing a closed item is a smaller failure than hiding an open one");
@@ -1963,18 +2912,119 @@ test("a project whose type definitions cannot be read keeps its items rather tha
     }
 });
 
-test("a connection with a project still uses the exact project-scoped query", async () => {
+test("a logging failure cannot turn a missing work-item icon into a Home failure", async () => {
     const { namespace, canvas, requests } = await connectionCanvas({
         routes: {
             "/_apis/wit/wiql": { workItems: [{ id: 1 }] },
             "/_apis/wit/workitems": {
-                value: [{ id: 1, fields: { "System.WorkItemType": "Task", "System.Title": "Open", "System.State": "Active", "System.TeamProject": "Project" } }],
+                value: [{
+                    id: 1,
+                    fields: {
+                        "System.WorkItemType": "Task",
+                        "System.Title": "Still visible",
+                        "System.State": "Active",
+                    },
+                }],
             },
-            "/_apis/wit/workitemtypes": { value: [{ name: "Task", states: [{ name: "Finished", category: "Completed" }] }] },
+            "/_apis/wit/workitemtypes": {
+                value: [{
+                    name: "Task",
+                    color: "123456",
+                    icon: { id: "icon_task" },
+                    states: [{ name: "Finished", category: "Completed" }],
+                }],
+            },
+            "/_apis/wit/workItemIcons/icon_task": () => new Response(
+                JSON.stringify({ message: "icon unavailable" }),
+                { status: 503 },
+            ),
+        },
+    });
+    namespace.setCopilotSession({
+        workspacePath: tmpdir(),
+        rpc: { mcp: { list: async () => [] }, metadata: { snapshot: async () => ({}) } },
+        log: async () => {
+            throw new Error("logging unavailable");
         },
     });
     try {
+        const result = await namespace.queryMyOpenWorkItems({
+            organization: "fabrikam",
+            project: "Project",
+        });
+
+        assert.equal(result.workItems.length, 1);
+        assert.equal(result.workItems[0].title, "Still visible");
+        assert.equal(result.workItems[0].typeIcon, "");
+        await namespace.queryMyOpenWorkItems({
+            organization: "fabrikam",
+            project: "Project",
+        });
+        assert.equal(
+            requests.filter((request) => request.pathname.endsWith("/_apis/wit/workItemIcons/icon_task")).length,
+            2,
+            "failed icon requests remain retryable",
+        );
+    } finally {
+        canvas.close();
+    }
+});
+
+test("a connection with a project still uses the exact project-scoped query", async () => {
+    const icon = "<svg xmlns=\"http://www.w3.org/2000/svg\"><path d=\"M0 0h1v1z\"/></svg>";
+    const { namespace, canvas, requests } = await connectionCanvas({
+        routes: {
+            "/_apis/connectionData": { authenticatedUser: { id: "me", displayName: "Me" } },
+            "/_apis/git/repositories": {
+                value: [{
+                    id: "repo",
+                    name: "playground",
+                    defaultBranch: "refs/heads/main",
+                    project: { id: "project", name: "Project" },
+                }],
+            },
+            "/_apis/git/repositories/repo/pullrequests": {
+                value: [{
+                    pullRequestId: 42,
+                    title: "Improve Home",
+                    repository: { id: "repo", name: "playground" },
+                    createdBy: { id: "me", displayName: "Me" },
+                }],
+            },
+            "/pullRequests/42/threads": {
+                value: [
+                    { status: "active", comments: [{ id: 1, content: "Please update this." }] },
+                    { status: "fixed", comments: [{ id: 2, content: "Done." }] },
+                    { status: "active", comments: [{ id: 3, content: "Deleted.", isDeleted: true }] },
+                    {
+                        status: "active",
+                        properties: { CodeReviewThreadType: { $value: "MergeAttempt" } },
+                        comments: [{ id: 4, commentType: "system", content: "Merge status changed." }],
+                    },
+                ],
+            },
+            "/_apis/wit/wiql": { workItems: [{ id: 1 }] },
+            "/_apis/wit/workitems": {
+                value: [{ id: 1, fields: { "System.WorkItemType": "Task", "System.Title": "Open", "System.State": "Active", "System.TeamProject": "Project" } }],
+            },
+            "/_apis/wit/workitemtypes": {
+                value: [{
+                    name: "Task",
+                    color: "123456",
+                    icon: { id: "icon_task" },
+                    states: [{ name: "Finished", category: "Completed" }],
+                }],
+            },
+            "/_apis/wit/workItemIcons/icon_task": () => new Response(icon, {
+                status: 200,
+                headers: { "content-type": "image/svg+xml" },
+            }),
+        },
+    });
+    try {
+        const workItems = await namespace.queryMyOpenWorkItems({ organization: "fabrikam", project: "Project" });
         await namespace.queryMyOpenWorkItems({ organization: "fabrikam", project: "Project" });
+        await namespace.queryMyOpenWorkItems({ organization: "fabrikam", project: "OtherProject" });
         const wiql = requests.find((request) => request.pathname.endsWith("/_apis/wit/wiql"));
         assert.equal(wiql.pathname, "/fabrikam/Project/_apis/wit/wiql");
         assert.ok(
@@ -1982,6 +3032,107 @@ test("a connection with a project still uses the exact project-scoped query", as
             "the project is an explicit WIQL predicate, not only a route segment",
         );
         assert.ok(wiql.body.includes("[System.State] NOT IN ('Finished')"), "the filter is expressed in the query");
+        assert.match(workItems.workItems[0].typeIcon, /^data:image\/svg\+xml;base64,/);
+        const iconRequest = requests.find((entry) => entry.pathname.endsWith("/workItemIcons/icon_task"));
+        assert.equal(new URLSearchParams(iconRequest.search).get("color"), "123456");
+        assert.equal(
+            requests.filter((entry) => entry.pathname.endsWith("/workItemIcons/icon_task")).length,
+            1,
+            "organization-scoped icon data is shared across repeated loads and projects",
+        );
+
+        const pullRequests = await namespace.listMyPullRequests({
+            organization: "fabrikam",
+            project: "Project",
+            repositoryId: "repo",
+        });
+        assert.equal(pullRequests.pullRequests[0].openCommentCount, 1);
+        assert.equal(pullRequests.pullRequests[0].commentCount, 2);
+
+        await namespace.listMyPullRequests({
+            organization: "fabrikam",
+            project: "Project",
+            repositoryId: "repo",
+        });
+        assert.equal(
+            requests.filter((request) => request.pathname.endsWith("/pullRequests/42/threads")).length,
+            1,
+            "a Home refresh reuses the short-lived comment-count cache",
+        );
+    } finally {
+        canvas.close();
+    }
+});
+
+test("a pull request thread failure does not hide the Home pull request list", async () => {
+    const { namespace, canvas } = await connectionCanvas({
+        routes: {
+            "/_apis/connectionData": { authenticatedUser: { id: "me", displayName: "Me" } },
+            "/_apis/git/repositories": {
+                value: [{
+                    id: "repo",
+                    name: "playground",
+                    defaultBranch: "refs/heads/main",
+                    project: { id: "project", name: "Project" },
+                }],
+            },
+            "/_apis/git/repositories/repo/pullrequests": {
+                value: [{
+                    pullRequestId: 42,
+                    title: "Still visible",
+                    repository: { id: "repo", name: "playground" },
+                    createdBy: { id: "me", displayName: "Me" },
+                }],
+            },
+            "/pullRequests/42/threads": () => new Response(
+                JSON.stringify({ message: "thread access denied" }),
+                { status: 403 },
+            ),
+        },
+    });
+    try {
+        const result = await namespace.listMyPullRequests({
+            organization: "fabrikam",
+            project: "Project",
+            repositoryId: "repo",
+        });
+
+        assert.equal(result.pullRequests.length, 1);
+        assert.equal(result.pullRequests[0].title, "Still visible");
+        assert.equal(result.pullRequests[0].openCommentCount, 0);
+        assert.equal(result.pullRequests[0].commentCount, 0);
+    } finally {
+        canvas.close();
+    }
+});
+
+test("a pull request without a repository still appears in the Home list", async () => {
+    const { namespace, canvas, requests } = await connectionCanvas({
+        routes: {
+            "/_apis/connectionData": { authenticatedUser: { id: "me", displayName: "Me" } },
+            "/_apis/git/pullrequests": {
+                value: [{
+                    pullRequestId: 42,
+                    title: "Partial response",
+                    createdBy: { id: "me", displayName: "Me" },
+                }],
+            },
+        },
+    });
+    try {
+        const result = await namespace.listMyPullRequests({
+            organization: "fabrikam",
+            project: "Project",
+        });
+
+        assert.equal(result.pullRequests.length, 1);
+        assert.equal(result.pullRequests[0].title, "Partial response");
+        assert.equal(result.pullRequests[0].openCommentCount, 0);
+        assert.equal(result.pullRequests[0].commentCount, 0);
+        assert.equal(
+            requests.some((request) => request.pathname.endsWith("/pullRequests/42/threads")),
+            false,
+        );
     } finally {
         canvas.close();
     }
@@ -2060,6 +3211,64 @@ test("a work item opened from an organization-scope list resolves its own projec
         const itemParams = new URLSearchParams(itemRequest.search);
         assert.equal(itemParams.get("$expand"), "Relations");
         assert.equal(itemParams.get("fields"), null);
+    } finally {
+        canvas.close();
+    }
+});
+
+test("a work item can delegate through its shared canvas connection without an open board", async () => {
+    let delegated;
+    const organization = "https://fabrikam.visualstudio.com";
+    const { namespace, canvas } = await connectionCanvas({
+        routes: {
+            "/_apis/wit/workitems/42": {
+                id: 42,
+                rev: 3,
+                fields: {
+                    "System.WorkItemType": "Task",
+                    "System.Title": "Delegate from Home",
+                    "System.State": "Active",
+                    "System.TeamProject": "Project",
+                },
+            },
+            "/comments": { comments: [] },
+            "/_apis/wit/workitemtypes/Task": { name: "Task", xmlForm: "" },
+        },
+        serverOptions: {
+            delegateWorkItem: async (input) => {
+                delegated = input;
+                return { ok: true, state: "Active" };
+            },
+        },
+    });
+    try {
+        canvas.entry.featureFlags.delegation = true;
+        await authed(canvas, "/api/connection", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ organization, project: "Project" }),
+        });
+        const response = await authed(
+            canvas,
+            `/api/work-items/42/delegate?organization=${encodeURIComponent(organization)}&project=Project&workItemProject=Project`,
+            {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ mode: "local", force: false }),
+            },
+        );
+        assert.equal(response.status, 200, JSON.stringify(await response.clone().json()));
+        assert.deepEqual(await response.json(), { ok: true, state: "Active" });
+        assert.equal(delegated.mode, "local");
+        assert.equal(delegated.force, false);
+        assert.equal(delegated.connection.organization, organization);
+        assert.equal(delegated.connection.project, "Project");
+        assert.equal(delegated.dataProvider.name, "canvas-rest");
+        assert.equal(delegated.item.id, 42);
+        assert.equal(delegated.item.title, "Delegate from Home");
+        const detail = await delegated.dataProvider.fetchItemDetail(42, { includeComments: false });
+        assert.equal(detail.browseUrl, "https://fabrikam.visualstudio.com/Project/_workitems/edit/42");
+
     } finally {
         canvas.close();
     }
@@ -2844,7 +4053,7 @@ test("the pull request action routes reach Azure DevOps and cannot be retargeted
         });
         assert.equal(saved.status, 200, JSON.stringify(await saved.clone().json()));
 
-        const query = "?organization=fabrikam&project=project";
+        const query = "?organization=fabrikam&project=project&pullRequestProject=target-project&pullRequestRepositoryId=target-repo";
         const send = async (path, method, body) => {
             const response = await fetch(`${canvas.base}${path}${query}`, {
                 method,
@@ -2887,6 +4096,8 @@ test("the pull request action routes reach Azure DevOps and cannot be retargeted
         assert.ok(ado.requests.some((request) =>
             request.method === "PATCH" &&
             request.path.endsWith("/pullrequests/42/threads/7")));
+        assert.ok(ado.requests.some((request) =>
+            request.path.startsWith("/fabrikam/target-project/_apis/git/")));
         assert.ok(ado.requests.some((request) =>
             request.method === "POST" &&
             request.path.toLowerCase().endsWith("/workitems/55/comments")));
@@ -3087,4 +4298,467 @@ test("an unlink whose relations moved underneath it is reported, not applied to 
     } finally {
         canvas.close();
     }
+});
+
+
+const ATTACHMENT_PROJECT = "4e1c4e8f-0c57-4a25-9a4e-2e2c2f4d8a55";
+const ATTACHMENT_ID = "06f5932c-aa2f-4545-9764-8546bec98914";
+const ATTACHMENT_URL = `https://dev.azure.com/fabrikam/${ATTACHMENT_PROJECT}/_apis/wit/attachments/${ATTACHMENT_ID}?fileName=image.png`;
+
+async function loadAttachmentServer(fetchImpl) {
+    const stubs = discoveryStubs({ installed: true });
+    writeMarker(stubs.markerPath);
+    const { impl: execFileImpl } = execFileStub((done) => done(null, { stdout: "test-access-token", stderr: "" }));
+    return loadCanvasServer({
+        execFileImpl,
+        existsSyncImpl: stubs.existsSyncImpl,
+        readdirSyncImpl: stubs.readdirSyncImpl,
+        homedirImpl: stubs.homedirImpl,
+        fetchImpl,
+        browserTokenForTest: { access_token: "test-access-token", expires_in: 3600 },
+    });
+}
+
+test("an attachment URL is rebuilt from trusted parts rather than forwarded", async () => {
+    const stubs = discoveryStubs({ installed: false });
+    const { impl: execFileImpl } = execFileStub((done) => done(null, { stdout: "", stderr: "" }));
+    const namespace = await loadCanvasServer({ execFileImpl, ...stubs });
+    const validate = (value) => namespace.validateAttachmentUrl({ organization: "fabrikam" }, value);
+
+    assert.equal(validate(ATTACHMENT_URL).href, ATTACHMENT_URL);
+    assert.equal(
+        validate(`${ATTACHMENT_URL}&download=true&api-version=7.1#frag`).href,
+        ATTACHMENT_URL,
+    );
+    assert.equal(
+        validate(`https://dev.azure.com/fabrikam/${ATTACHMENT_PROJECT}/_apis/wit/attachments/${ATTACHMENT_ID}`).href,
+        `https://dev.azure.com/fabrikam/${ATTACHMENT_PROJECT}/_apis/wit/attachments/${ATTACHMENT_ID}`,
+    );
+    assert.equal(
+        namespace.validateAttachmentUrl({ organization: "Fabrikam" }, ATTACHMENT_URL).href,
+        ATTACHMENT_URL.replace("/fabrikam/", "/Fabrikam/"),
+        "organization casing is compared insensitively and rebuilt from trusted configuration",
+    );
+});
+
+test("attachment URLs are restricted to project attachments in the configured organization", async () => {
+    const stubs = discoveryStubs({ installed: false });
+    const { impl: execFileImpl } = execFileStub((done) => done(null, { stdout: "", stderr: "" }));
+    const namespace = await loadCanvasServer({ execFileImpl, ...stubs });
+    const validate = (value) => namespace.validateAttachmentUrl({ organization: "fabrikam" }, value);
+    const rejected = [
+        "not a url",
+        `http://dev.azure.com/fabrikam/${ATTACHMENT_PROJECT}/_apis/wit/attachments/${ATTACHMENT_ID}`,
+        `https://example.com/fabrikam/${ATTACHMENT_PROJECT}/_apis/wit/attachments/${ATTACHMENT_ID}`,
+        `https://dev.azure.com/other/${ATTACHMENT_PROJECT}/_apis/wit/attachments/${ATTACHMENT_ID}`,
+        `https://dev.azure.com/fabrikam/MyProject/_apis/wit/attachments/${ATTACHMENT_ID}`,
+        `https://dev.azure.com/fabrikam/${ATTACHMENT_PROJECT}/_apis/wit/attachments/not-a-guid`,
+        `https://dev.azure.com/fabrikam/${ATTACHMENT_PROJECT}/_apis/git/attachments/${ATTACHMENT_ID}`,
+        `https://dev.azure.com/fabrikam/${ATTACHMENT_PROJECT}/_apis/wit/attachments/${ATTACHMENT_ID}/extra`,
+        `https://dev.azure.com/fabrikam/${ATTACHMENT_PROJECT}/_apis/wit/attachments/../../_apis/projects`,
+    ];
+    for (const value of rejected) {
+        assert.throws(() => validate(value), (error) => error.code === "azure_devops_invalid_attachment_url", value);
+    }
+});
+
+test("attachments are fetched with the token and returned with their image type", async () => {
+    const requests = [];
+    const namespace = await loadAttachmentServer(async (url, options) => {
+        requests.push({ url: String(url), redirect: options?.redirect, authorization: options?.headers?.Authorization });
+        return new Response(Buffer.from("png-bytes"), { status: 200, headers: { "content-type": "image/png; charset=binary" } });
+    });
+    const canvas = await startCanvas(namespace);
+    try {
+        const result = await namespace.fetchAttachment({ organization: "fabrikam" }, ATTACHMENT_URL);
+        assert.equal(result.content.toString(), "png-bytes");
+        assert.equal(result.contentType, "image/png");
+        assert.deepEqual(requests.map(({ url, redirect }) => ({ url, redirect })), [{ url: ATTACHMENT_URL, redirect: "manual" }]);
+        assert.match(requests[0].authorization, /^Bearer /);
+    } finally {
+        canvas.close();
+    }
+});
+
+test("attachment redirects are revalidated and cannot leave the organization", async () => {
+    const namespace = await loadAttachmentServer(async () => new Response(null, {
+        status: 302,
+        headers: { location: "https://example.com/image.png" },
+    }));
+    const canvas = await startCanvas(namespace);
+    try {
+        await assert.rejects(
+            namespace.fetchAttachment({ organization: "fabrikam" }, ATTACHMENT_URL),
+            (error) => error.code === "azure_devops_invalid_attachment_url",
+        );
+    } finally {
+        canvas.close();
+    }
+});
+
+test("attachments that are not raster images are rejected", async () => {
+    for (const contentType of ["image/svg+xml", "text/html"]) {
+        const namespace = await loadAttachmentServer(async () => new Response("<svg/>", { status: 200, headers: { "content-type": contentType } }));
+        const canvas = await startCanvas(namespace);
+        try {
+            await assert.rejects(
+                namespace.fetchAttachment({ organization: "fabrikam" }, ATTACHMENT_URL),
+                (error) => error.code === "azure_devops_attachment_invalid_type",
+                contentType,
+            );
+        } finally {
+            canvas.close();
+        }
+    }
+});
+
+test("attachment responses stop streaming when they exceed the size limit", async () => {
+    let pulls = 0;
+    let cancelled = false;
+    const body = new ReadableStream({
+        pull(controller) {
+            pulls += 1;
+            controller.enqueue(new Uint8Array(4 * 1024 * 1024 + (pulls === 3 ? 1 : 0)));
+        },
+        cancel() {
+            cancelled = true;
+        },
+    }, { highWaterMark: 0 });
+    const namespace = await loadAttachmentServer(async () => new Response(body, { status: 200, headers: { "content-type": "image/png" } }));
+    const canvas = await startCanvas(namespace);
+    try {
+        await assert.rejects(
+            namespace.fetchAttachment({ organization: "fabrikam" }, ATTACHMENT_URL),
+            (error) => error.code === "azure_devops_attachment_too_large",
+        );
+        assert.equal(pulls, 3);
+        assert.equal(cancelled, true);
+    } finally {
+        canvas.close();
+    }
+});
+
+test("attachment requests need the API nonce and an image URL", async () => {
+    const stubs = discoveryStubs({ installed: false });
+    const { impl: execFileImpl } = execFileStub((done) => done(null, { stdout: "", stderr: "" }));
+    const namespace = await loadCanvasServer({ execFileImpl, ...stubs });
+    const canvas = await startCanvas(namespace);
+    try {
+        const badNonce = await fetch(`${canvas.base}/api/attachment?nonce=wrong&url=${encodeURIComponent(ATTACHMENT_URL)}`);
+        assert.equal(badNonce.status, 400);
+        assert.equal((await badNonce.json()).error, "azure_devops_invalid_nonce");
+        const missingUrl = await fetch(`${canvas.base}/api/attachment?nonce=${encodeURIComponent(canvas.apiNonce)}`);
+        assert.equal(missingUrl.status, 400);
+        assert.equal((await missingUrl.json()).error, "azure_devops_invalid_attachment_request");
+    } finally {
+        canvas.close();
+    }
+});
+
+const RASTER_PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=", "base64");
+const MAX_INLINE_BYTES = 8 * 1024 * 1024;
+
+async function attachmentHttpFixture(t, fetchImpl) {
+    const stubs = discoveryStubs({ installed: true });
+    t.after(() => rmSync(stubs.home, { recursive: true, force: true }));
+    writeMarker(stubs.markerPath);
+    const { impl: execFileImpl } = execFileStub((done) => done(null, { stdout: "test-access-token", stderr: "" }));
+    const requests = [];
+    const namespace = await loadCanvasServer({
+        ...stubs,
+        execFileImpl,
+        browserTokenForTest: { access_token: "test-access-token", expires_in: 3600 },
+        fetchImpl: async (url, options) => {
+            requests.push({ url: String(url), options });
+            return fetchImpl(url, options);
+        },
+    });
+    const canvas = await startCanvas(namespace, {}, { organization: "fabrikam", project: ATTACHMENT_PROJECT });
+    t.after(() => canvas.close());
+    const imageUrl = (value = ATTACHMENT_URL, nonce = canvas.apiNonce) =>
+        `${canvas.base}/api/attachment?${new URLSearchParams({ url: value, nonce })}`;
+    return { canvas, requests, imageUrl };
+}
+
+async function attachmentOriginFixture(t) {
+    const requests = [];
+    const server = createServer((req, res) => {
+        const authorized = req.headers.authorization === "Bearer test-access-token";
+        requests.push({ authorized, path: req.url });
+        if (!authorized) {
+            res.writeHead(302, { location: "/sign-in" });
+            res.end();
+            return;
+        }
+        res.writeHead(200, { "content-type": "image/png" });
+        res.end(RASTER_PNG);
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    t.after(() => {
+        server.closeAllConnections();
+        server.close();
+    });
+    const base = `http://127.0.0.1:${server.address().port}`;
+    return { base, requests };
+}
+
+test("attachment HTTP regression: canvas delivers authenticated raster bytes through its nonce URL", async (t) => {
+    const origin = await attachmentOriginFixture(t);
+    const fixture = await attachmentHttpFixture(t, (url, options) => {
+        const target = new URL(url);
+        assert.equal(target.origin, "https://dev.azure.com");
+        return fetch(`${origin.base}${target.pathname}${target.search}`, options);
+    });
+    const response = await fetch(fixture.imageUrl());
+    const bytes = Buffer.from(await response.arrayBuffer());
+    t.diagnostic(`actual canvas response: status=${response.status}; type=${response.headers.get("content-type")}; upstream requests=${fixture.requests.length}; body=${bytes.toString().slice(0, 180)}`);
+    if (response.status !== 200) {
+        const headerNonceResponse = await fetch(fixture.imageUrl(), { headers: { "x-canvas-nonce": fixture.canvas.apiNonce } });
+        t.diagnostic(`same route with valid header nonce: status=${headerNonceResponse.status}; body=${await headerNonceResponse.text()}; upstream requests=${fixture.requests.length}`);
+    }
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "image/png");
+    assert.deepEqual(bytes, RASTER_PNG);
+    assert.equal(fixture.requests.length, 1);
+    assert.equal(fixture.requests[0].url, ATTACHMENT_URL);
+    assert.equal(fixture.requests[0].options.redirect, "manual");
+    assert.equal(fixture.requests[0].options.headers.Authorization, "Bearer test-access-token");
+    assert.equal(origin.requests[0].authorized, true);
+});
+
+test("attachment HTTP mechanism: controlled origin requires bearer for the identical raster URL", async (t) => {
+    const origin = await attachmentOriginFixture(t);
+    const url = `${origin.base}${new URL(ATTACHMENT_URL).pathname}?fileName=image.png`;
+    const anonymous = await fetch(url, { redirect: "manual" });
+    const authorized = await fetch(url, { headers: { Authorization: "Bearer test-access-token" }, redirect: "manual" });
+    assert.equal(anonymous.status, 302);
+    assert.equal(authorized.status, 200);
+    assert.equal(authorized.headers.get("content-type"), "image/png");
+    assert.deepEqual(Buffer.from(await authorized.arrayBuffer()), RASTER_PNG);
+    t.diagnostic("controlled HTTP origin: identical URL anonymous=302 /sign-in; synthetic bearer=200 image/png; PNG bytes identical");
+});
+
+test("attachment HTTP regression: nonce and missing-target checks run without upstream requests", async (t) => {
+    const fixture = await attachmentHttpFixture(t, () => { throw new Error("must not fetch"); });
+    for (const nonce of ["wrong", ""]) {
+        const response = await fetch(fixture.imageUrl(ATTACHMENT_URL, nonce));
+        assert.equal(response.status, 400);
+        assert.equal((await response.json()).error, "azure_devops_invalid_nonce");
+    }
+    const response = await fetch(`${fixture.canvas.base}/api/attachment?nonce=${fixture.canvas.apiNonce}`);
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error, "azure_devops_invalid_attachment_request");
+    assert.equal(fixture.requests.length, 0);
+});
+
+test("attachment HTTP regression: Host validation rejects a nonce-bearing cross-host request", async (t) => {
+    const fixture = await attachmentHttpFixture(t, () => { throw new Error("must not fetch"); });
+    const result = await new Promise((resolve, reject) => {
+        const req = request(fixture.imageUrl(), { headers: { Host: "example.com" } }, (res) => {
+            let body = "";
+            res.setEncoding("utf8");
+            res.on("data", (chunk) => { body += chunk; });
+            res.on("end", () => resolve({ status: res.statusCode, body: JSON.parse(body) }));
+        });
+        req.on("error", reject);
+        req.end();
+    });
+    assert.equal(result.status, 400);
+    assert.equal(result.body.error, "azure_devops_invalid_host");
+    assert.equal(fixture.requests.length, 0);
+});
+
+test("attachment HTTP regression: untrusted targets never receive bearer credentials", async (t) => {
+    const fixture = await attachmentHttpFixture(t, () => new Response(RASTER_PNG, { headers: { "content-type": "image/png" } }));
+    const targets = [
+        ATTACHMENT_URL.replace("dev.azure.com", "example.com"),
+        ATTACHMENT_URL.replace("/fabrikam/", "/other/"),
+        ATTACHMENT_URL.replace("https:", "http:"),
+        ATTACHMENT_URL.replace(ATTACHMENT_PROJECT, "not-a-project-guid"),
+        ATTACHMENT_URL.replace(ATTACHMENT_ID, "not-an-attachment-guid"),
+        `${ATTACHMENT_URL.split("?")[0]}/extra`,
+    ];
+    for (const target of targets) {
+        const response = await fetch(fixture.imageUrl(target));
+        assert.equal(response.status, 400);
+        assert.equal((await response.json()).error, "azure_devops_invalid_attachment_url", target);
+    }
+    assert.equal(fixture.requests.length, 0);
+});
+
+test("attachment HTTP regression: target is rebuilt and extraneous query and fragment are removed", async (t) => {
+    const fixture = await attachmentHttpFixture(t, () => new Response(RASTER_PNG, { headers: { "content-type": "image/png" } }));
+    const response = await fetch(fixture.imageUrl(`${ATTACHMENT_URL}&download=true&api-version=7.1#fragment`));
+    assert.equal(response.status, 200);
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), RASTER_PNG);
+    assert.equal(fixture.requests[0].url, ATTACHMENT_URL);
+});
+
+test("attachment HTTP uses a connected secondary organization and rejects unconnected selectors", async (t) => {
+    const stubs = discoveryStubs({ installed: false });
+    t.after(() => rmSync(stubs.home, { recursive: true, force: true }));
+    const { impl: execFileImpl } = execFileStub(() => assert.fail("unexpected AzureAuth request"));
+    const requests = [];
+    const namespace = await loadCanvasServer({
+        ...stubs,
+        execFileImpl,
+        browserTokenForTest: { access_token: "test-access-token", expires_in: 3600 },
+        fetchImpl: async (url) => {
+            requests.push(String(url));
+            return new Response(RASTER_PNG, { headers: { "content-type": "image/png" } });
+        },
+    });
+    const canvas = await startCanvas(namespace);
+    t.after(() => canvas.close());
+    for (const [organization, isDefault] of [["fabrikam", true], ["contoso", false]]) {
+        const response = await authed(canvas, "/api/connection", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ organization, project: ATTACHMENT_PROJECT, isDefault }),
+        });
+        assert.equal(response.status, 200);
+    }
+    const connections = (await canvas.config2()).connections;
+    assert.deepEqual(connections.map((connection) => connection.organization), ["contoso", "fabrikam"]);
+    const imageUrl = (organization, url = ATTACHMENT_URL) =>
+        `${canvas.base}/api/attachment?${new URLSearchParams({
+            organization, project: ATTACHMENT_PROJECT, url, nonce: canvas.apiNonce,
+        })}`;
+    const response = await fetch(imageUrl("fabrikam"));
+    assert.equal(response.status, 200);
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), RASTER_PNG);
+    assert.deepEqual(requests, [ATTACHMENT_URL]);
+
+    const unknown = await fetch(imageUrl("unconnected", ATTACHMENT_URL.replace("/fabrikam/", "/unconnected/")));
+    assert.equal(unknown.status, 400);
+    assert.equal((await unknown.json()).error, "azure_devops_unknown_connection");
+    const wrongOrganization = await fetch(imageUrl("contoso"));
+    assert.equal(wrongOrganization.status, 400);
+    assert.equal((await wrongOrganization.json()).error, "azure_devops_invalid_attachment_url");
+    assert.equal(requests.length, 1, "invalid selectors and cross-organization URLs never reach Azure DevOps");
+});
+
+test("attachment HTTP regression: cross-host redirect never receives a second bearer request", async (t) => {
+    const fixture = await attachmentHttpFixture(t, () => new Response(null, { status: 302, headers: { location: "https://example.com/image.png" } }));
+    const response = await fetch(fixture.imageUrl());
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error, "azure_devops_invalid_attachment_url");
+    assert.equal(fixture.requests.length, 1);
+    assert.equal(fixture.requests[0].options.redirect, "manual");
+});
+
+test("attachment HTTP regression: SVG and HTML cannot be served as inline raster images", async (t) => {
+    for (const type of ["image/svg+xml", "text/html"]) {
+        await t.test(type, async (t) => {
+            const fixture = await attachmentHttpFixture(t, () => new Response("<svg/>", { headers: { "content-type": type } }));
+            const response = await fetch(fixture.imageUrl());
+            assert.equal(response.status, 400);
+            assert.equal((await response.json()).error, "azure_devops_attachment_invalid_type");
+            assert.equal(fixture.requests.length, 1);
+        });
+    }
+});
+
+test("attachment HTTP regression: exactly 8 MiB is allowed and one byte more cancels the stream", async (t) => {
+    for (const extra of [0, 1]) {
+        await t.test(`8 MiB + ${extra}`, async (t) => {
+            let cancelled = false;
+            let pulls = 0;
+            const fixture = await attachmentHttpFixture(t, () => new Response(new ReadableStream({
+                pull(controller) {
+                    pulls += 1;
+                    if (pulls === 1) controller.enqueue(new Uint8Array(MAX_INLINE_BYTES));
+                    else if (pulls === 2 && extra) controller.enqueue(new Uint8Array(extra));
+                    else controller.close();
+                },
+                cancel() { cancelled = true; },
+            }, { highWaterMark: 0 }), { headers: { "content-type": "image/png" } }));
+            const response = await fetch(fixture.imageUrl());
+            assert.equal(response.status, extra ? 400 : 200);
+            if (extra) {
+                assert.equal((await response.json()).error, "azure_devops_attachment_too_large");
+                assert.equal(cancelled, true);
+                assert.equal(pulls, 2);
+            } else {
+                assert.equal((await response.arrayBuffer()).byteLength, MAX_INLINE_BYTES);
+                assert.equal(cancelled, false);
+            }
+        });
+    }
+});
+
+test("image proxy regression: attachments share avatar redirect and response bounds", async (t) => {
+    for (const type of ["image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp"]) {
+        await t.test(`attachment MIME ${type}`, async (t) => {
+            const fixture = await attachmentHttpFixture(t, () => new Response(RASTER_PNG, {
+                headers: { "content-type": `${type}; charset=binary` },
+            }));
+            const response = await fetch(fixture.imageUrl());
+            assert.equal(response.status, 200);
+            assert.equal(response.headers.get("content-type"), type);
+            assert.deepEqual(Buffer.from(await response.arrayBuffer()), RASTER_PNG);
+        });
+    }
+    await t.test("relative redirect is rebuilt and a second redirect is not followed", async (t) => {
+        const fixture = await attachmentHttpFixture(t, () => new Response(null, {
+            status: 302,
+            headers: { location: `${new URL(ATTACHMENT_URL).pathname}?fileName=image.png&download=true#fragment` },
+        }));
+        const response = await fetch(fixture.imageUrl());
+        assert.equal(response.status, 400);
+        assert.equal((await response.json()).error, "azure_devops_attachment_failed");
+        assert.equal(fixture.requests.length, 2);
+        for (const { url, options } of fixture.requests) {
+            assert.equal(url, ATTACHMENT_URL);
+            assert.equal(options.redirect, "manual");
+            assert.equal(options.headers.Authorization, "Bearer test-access-token");
+        }
+    });
+    await t.test("oversized content-length cancels without reading", async (t) => {
+        let cancelled = false;
+        const fixture = await attachmentHttpFixture(t, () => new Response(new ReadableStream({
+            pull() { assert.fail("must reject the advertised size before reading"); },
+            cancel() { cancelled = true; },
+        }, { highWaterMark: 0 }), {
+            headers: { "content-type": "image/png", "content-length": String(MAX_INLINE_BYTES + 1) },
+        }));
+        const response = await fetch(fixture.imageUrl());
+        assert.equal(response.status, 400);
+        assert.equal((await response.json()).error, "azure_devops_attachment_too_large");
+        assert.equal(cancelled, true);
+    });
+});
+
+test("image proxy regression: avatars retain their MIME and 2 MiB limits", async (t) => {
+    for (const extra of [0, 1]) {
+        await t.test(`avatar 2 MiB + ${extra}`, async () => {
+            let cancelled = false;
+            let pulls = 0;
+            const namespace = await loadAttachmentServer(async () => new Response(new ReadableStream({
+                pull(controller) {
+                    pulls += 1;
+                    if (pulls === 1) controller.enqueue(new Uint8Array(2 * 1024 * 1024));
+                    else if (pulls === 2 && extra) controller.enqueue(new Uint8Array(extra));
+                    else controller.close();
+                },
+                cancel() { cancelled = true; },
+            }, { highWaterMark: 0 }), { headers: { "content-type": "image/png" } }));
+            const result = namespace.fetchAvatar({ organization: "fabrikam" }, "https://dev.azure.com/fabrikam/_api/_common/identityImage?id=123");
+            if (extra) {
+                await assert.rejects(result, (error) => error.code === "azure_devops_avatar_too_large");
+                assert.equal(cancelled, true);
+                assert.equal(pulls, 2);
+            } else {
+                assert.equal((await result).content.length, 2 * 1024 * 1024);
+                assert.equal(cancelled, false);
+            }
+        });
+    }
+    await t.test("BMP remains unsupported for avatars", async () => {
+        const namespace = await loadAttachmentServer(async () => new Response(RASTER_PNG, { headers: { "content-type": "image/bmp" } }));
+        await assert.rejects(
+            namespace.fetchAvatar({ organization: "fabrikam" }, "https://dev.azure.com/fabrikam/_api/_common/identityImage?id=123"),
+            (error) => error.code === "azure_devops_avatar_invalid_type",
+        );
+    });
 });

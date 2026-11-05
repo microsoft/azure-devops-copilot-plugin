@@ -329,7 +329,7 @@ function renderThread(thread, options) {
         } else {
             post.append(commentByline(comment, avatarUrl));
         }
-        post.append(richTextElement("div", "comment-post-content", displayCommentText(comment), { format: "markdown" }));
+        post.append(richTextElement("div", "comment-post-content", displayCommentText(comment), { format: "markdown", imageUrl: options.imageUrl }));
         card.append(post);
     }
     if (thread.isResolvable !== false) {
@@ -418,12 +418,12 @@ function renderThread(thread, options) {
     return card;
 }
 
-function timelineEvent(entry) {
+function timelineEvent(entry, options) {
     const event = element("div", "timeline-event");
     const marker = element("span", "timeline-event-marker");
     marker.setAttribute("aria-hidden", "true");
     const content = element("div", "timeline-event-content");
-    content.append(richTextElement("span", "timeline-event-text", entry.text, { inline: true, format: "markdown" }));
+    content.append(richTextElement("span", "timeline-event-text", entry.text, { inline: true, format: "markdown", imageUrl: options.imageUrl }));
     const age = relativeTime(entry.timestamp);
     if (age) {
         content.append(document.createTextNode(" · "), element("span", "timeline-event-age", age));
@@ -493,13 +493,14 @@ function renderDescription(pr, options, fields) {
 
     if (!options.editMode) {
         block.append(pr.description
-            ? richTextElement("div", "pr-description-content", pr.description, { format: "markdown" })
+            ? richTextElement("div", "pr-description-content", pr.description, { format: "markdown", imageUrl: options.imageUrl })
             : element("div", "pr-empty-state", "No description has been added."));
         return block;
     }
     const control = fields.add("description", createMarkdownField({
         label: "Pull request description",
         value: pr.description || "",
+        imageUrl: options.imageUrl,
         onDirtyChange: fields.onDirtyChange,
         onSubmit: options.onSubmit,
         onCancel: options.onCancelEdit,
@@ -664,7 +665,7 @@ export function renderPullRequest(container, pr, options) {
     for (const entry of visible) {
         content.append(entry.kind === "thread"
             ? renderThread(entry.thread, { ...options, pullRequestId: pr.id })
-            : timelineEvent(entry));
+            : timelineEvent(entry, options));
     }
     if (!visible.length) {
         content.append(element(

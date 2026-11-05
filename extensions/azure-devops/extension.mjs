@@ -10,6 +10,7 @@ import { hasWorkItemReference } from "./work-item.mjs";
 
 const servers = new Map();
 
+
 const canvasInputSchema = {
     type: "object",
     additionalProperties: false,
@@ -107,7 +108,7 @@ session = await joinSession({
                 } else {
                     const input = ctx.input || {};
                     if (serializeCanvasInput(entry.input) !== serializeCanvasInput(input)) {
-                        await new Promise((resolve) => entry.server.close(resolve));
+                        await new Promise((resolve, reject) => entry.server.close((error) => error ? reject(error) : resolve()));
                         entry = await startServer(ctx.instanceId, input);
                         servers.set(ctx.instanceId, entry);
                     }
@@ -124,9 +125,9 @@ session = await joinSession({
             },
             onClose: async (ctx) => {
                 const entry = servers.get(ctx.instanceId);
-                if (entry?.server) {
+                if (entry) {
                     servers.delete(ctx.instanceId);
-                    await new Promise((resolve) => entry.server.close(() => resolve()));
+                    await new Promise((resolve, reject) => entry.server.close((error) => error ? reject(error) : resolve()));
                 }
             },
         }),

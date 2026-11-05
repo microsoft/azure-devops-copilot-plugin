@@ -8,16 +8,16 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { CanvasError } from "@github/copilot-sdk/extension";
 import {
+    AGENCY_AUTH_ENABLED,
+    DEFAULT_FEATURE_FLAGS,
     encodePathPart,
     hasRenderableContent,
     normalizeMultilineFieldFormat,
     normalizeRichText,
+    normalizeFeatureFlags,
     normalizeString,
-} from "./common.mjs";
-import {
-    AGENCY_AUTH_ENABLED,
     PULL_REQUEST_REVIEW_VOTING_ENABLED,
-} from "./ui/feature-flags.mjs";
+} from "./common.mjs";
 // The write policy lives under ui/ because the browser editor enforces it too, and
 // only files under that directory are served to the canvas. It is DOM-free so the
 // same module loads here.
@@ -49,6 +49,28 @@ const PREVIEW_API_VERSION = "7.1-preview";
 const DEFAULT_STATUS = "active";
 const DEFAULT_LIST_LIMIT = 5;
 const HOME_LIST_LIMIT = 10;
+const PULL_REQUEST_COMMENT_COUNT_CACHE_TTL_MS = 60 * 1000;
+const PULL_REQUEST_COMMENT_COUNT_CACHE_LIMIT = 500;
+const PULL_REQUEST_COMMENT_COUNT_CONCURRENCY = 4;
+const WORK_ITEM_TYPE_ICON_CACHE_LIMIT = 500;
+const WORK_ITEM_TYPE_ICON_CONCURRENCY = 4;
+const FAVORITE_BOARD_ARTIFACT_TYPE = "Microsoft.TeamFoundation.Work.TeamBoardSets";
+const BOARD_BACKLOG_CATEGORY_IDS = [
+    "Microsoft.EpicCategory",
+    "Microsoft.FeatureCategory",
+    "Microsoft.RequirementCategory",
+    "Microsoft.TaskCategory",
+];
+const BOARD_CARD_FIELDS = [
+    "System.Id",
+    "System.Title",
+    "System.State",
+    "System.WorkItemType",
+    "System.Parent",
+    "System.AssignedTo",
+    "System.Tags",
+    "Microsoft.VSTS.Common.Priority",
+];
 const NEW_SESSION_BRANCH_PROMPT = "Create a new branch for the current session.";
 // How many recently-changed work items the organization-scope query pulls back
 // before filtering out the closed ones. Capped by the 200-id limit of the work
@@ -76,11 +98,19 @@ const AZURE_OAUTH_LOOPBACK_HOST = "localhost";
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 const PROJECT_EXTENSION_REPO_ROOT = resolve(EXTENSION_DIR, "..", "..");
 const UI_DIR = resolve(EXTENSION_DIR, "ui");
+const BROWSER_COMMON_MODULE_PATH = join(EXTENSION_DIR, "common.mjs");
 const EXTENSION_VERSION = loadExtensionVersion();
 const execFileAsync = promisify(execFile);
 const staticAssetCache = new Map();
 const workItemStateFilterCache = new Map();
+const workItemTypeDefinitionCache = new Map();
 const workItemTypeAppearanceCache = new Map();
+const workItemTypeIconCache = new Map();
+const workItemTypeIconQueue = [];
+const pullRequestCommentCountCache = new Map();
+const pullRequestCommentCountQueue = [];
+let activeWorkItemTypeIconRequests = 0;
+let activePullRequestCommentCountRequests = 0;
 let azureAuthTokenCache = null;
 let browserTokenCache = null;
 let silentAgencyAuthAttempt = null;
@@ -335,7 +365,7 @@ async function readAzureAuthTokenCache() {
     return azureAuthTokenCache;
 }
 
-function parseJwtExpiry(accessToken) {
+function parseJwtPayload(accessToken) {
     const [, payload] = normalizeString(accessToken).split(".");
     if (!payload) {
         return null;
@@ -343,12 +373,15 @@ function parseJwtExpiry(accessToken) {
     try {
         const normalized = payload.replaceAll("-", "+").replaceAll("_", "/");
         const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
-        const decoded = JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
-        const exp = Number(decoded?.exp);
-        return Number.isFinite(exp) && exp > 0 ? exp * 1000 : null;
+        return JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
     } catch {
         return null;
     }
+}
+
+function parseJwtExpiry(accessToken) {
+    const exp = Number(parseJwtPayload(accessToken)?.exp);
+    return Number.isFinite(exp) && exp > 0 ? exp * 1000 : null;
 }
 
 async function writeAzureAuthTokenCache(tokenResult) {
@@ -813,8 +846,13 @@ async function startMicrosoftAuth(entry) {
             complete("succeeded", "Signed in to Azure DevOps with Microsoft.", { expiresAt: cache.expiresAt });
         } catch (error) {
             clearTimeout(timeout);
-            const message = error instanceof CanvasError ? error.message : error?.message || "Microsoft sign-in failed.";
-            complete("failed", message, { error: errorPayload(error) });
+            const originalMessage = error instanceof CanvasError ? error.message : error?.message || "Microsoft sign-in failed.";
+            // Fetch's nested message can contain connection details; expose only a bounded error identifier.
+            const causeCode = error?.cause?.code;
+            const message = typeof causeCode === "string" && /^[A-Z][A-Z0-9_]{1,63}$/.test(causeCode)
+                ? `${originalMessage} (${causeCode})`
+                : originalMessage;
+            complete("failed", message, { error: { ...errorPayload(error), message } });
             res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
             res.end("<!doctype html><title>Sign-in failed</title><p>Sign-in failed. Return to the Azure DevOps canvas for details.</p>");
         }
@@ -1025,21 +1063,92 @@ function requireProject(config) {
     return project;
 }
 
-async function makeAuthHeaders(extraHeaders = {}) {
-    let token;
+// `cache` names the cache that supplied the token, so a token Azure DevOps
+// rejects can be dropped from the place it came from.
+async function getRequestToken() {
     try {
-        token = await getBrowserOAuthAccessToken();
+        return { ...(await getBrowserOAuthAccessToken()), cache: "browser-oauth" };
     } catch (error) {
         if (!AGENCY_AUTH_ENABLED) {
             throw error;
         }
-        token = await getAzureAuthAccessToken();
+        return { ...(await getAzureAuthAccessToken()), cache: "azureauth" };
     }
+}
+
+function authHeaders(token, extraHeaders = {}) {
     return {
         Accept: "application/json",
         Authorization: `Bearer ${token.accessToken}`,
+        // Without this, Azure DevOps answers a token it cannot validate by
+        // redirecting to the sign-in page, which ends in a 2xx HTML response that
+        // looks like success. With it, the same request fails with a 401.
+        "X-TFS-FedAuthRedirect": "Suppress",
         ...extraHeaders,
     };
+}
+
+async function makeAuthHeaders(extraHeaders = {}) {
+    return authHeaders(await getRequestToken(), extraHeaders);
+}
+
+function landedOnSignInPage(response) {
+    if (!response.redirected) {
+        return false;
+    }
+    try {
+        return new URL(response.url).pathname.toLowerCase() === "/_signin";
+    } catch {
+        return false;
+    }
+}
+
+// Drops the token Azure DevOps refused, unless a newer one has replaced it since,
+// so the auth state reports signed out and the UI offers sign-in again. Only the
+// token is dropped: the AzureAuth marker and connection preference are kept.
+function rejectAuthentication(response, token) {
+    const claims = parseJwtPayload(token.accessToken) || {};
+    const resourceTenant = normalizeString(response.headers?.get?.("x-vss-resourcetenant"));
+    void copilotSession?.log?.(
+        `Azure DevOps canvas: Azure DevOps rejected the ${token.cache} token `
+        + `(status ${response.status}; tid=${normalizeString(claims.tid)}; iss=${normalizeString(claims.iss)}; `
+        + `idtyp=${normalizeString(claims.idtyp)}; x-vss-resourcetenant=${resourceTenant}).`,
+    ).catch(() => {});
+    if (token.cache === "browser-oauth" && browserTokenCache?.accessToken === token.accessToken) {
+        browserTokenCache = null;
+    }
+    if (token.cache === "azureauth" && azureAuthTokenCache?.accessToken === token.accessToken) {
+        azureAuthTokenCache = null;
+    }
+    return new CanvasError("azure_devops_authentication_rejected", "Azure DevOps did not accept the sign-in. Sign in again.");
+}
+
+async function readAzureDevOpsJson(response, token) {
+    // A valid sign-in outside the organization also gets a 401, but Azure DevOps
+    // names that caller in x-vss-userdata. Only an unidentified 401 is a refused token.
+    const anonymous = response.status === 401 && !response.headers?.get?.("x-vss-userdata");
+    if (anonymous || landedOnSignInPage(response)) {
+        throw rejectAuthentication(response, token);
+    }
+    const text = await response.text();
+    let data = {};
+    if (text) {
+        try {
+            data = JSON.parse(text);
+        } catch {
+            // A successful status with a non-JSON body is the anonymous sign-in
+            // page, not data.
+            if (response.ok) {
+                throw rejectAuthentication(response, token);
+            }
+            data = { message: text };
+        }
+    }
+    if (!response.ok) {
+        const message = data?.message || data?.error?.message || response.statusText || "Azure DevOps request failed.";
+        throw new CanvasError("azure_devops_request_failed", `${response.status} ${message}`);
+    }
+    return data;
 }
 
 function buildApiUrl(config, path, params = {}, apiVersion = config.apiVersion || DEFAULT_API_VERSION) {
@@ -1056,25 +1165,38 @@ function buildApiUrl(config, path, params = {}, apiVersion = config.apiVersion |
 
 async function fetchJson(config, path, options = {}) {
     const url = buildApiUrl(config, path, options.params, options.apiVersion);
+    const token = await getRequestToken();
     const response = await fetch(url, {
         method: options.method || "GET",
-        headers: await makeAuthHeaders(options.headers),
+        headers: authHeaders(token, options.headers),
         body: options.body,
     });
-    const text = await response.text();
-    let data = {};
-    if (text) {
-        try {
-            data = JSON.parse(text);
-        } catch {
-            data = { message: text };
-        }
-    }
+    return readAzureDevOpsJson(response, token);
+}
+
+async function fetchImageDataUri(config, path, options = {}) {
+    const url = buildApiUrl(config, path, options.params, options.apiVersion);
+    const response = await fetch(url, {
+        headers: await makeAuthHeaders({
+            Accept: "image/svg+xml,image/png",
+            ...options.headers,
+        }),
+    });
     if (!response.ok) {
-        const message = data?.message || data?.error?.message || response.statusText || "Azure DevOps request failed.";
-        throw new CanvasError("azure_devops_request_failed", `${response.status} ${message}`);
+        throw new CanvasError(
+            "azure_devops_request_failed",
+            `${response.status} ${response.statusText || "Azure DevOps icon request failed."}`,
+        );
     }
-    return data;
+    const contentType = normalizeString(response.headers.get("content-type")).split(";")[0].toLowerCase();
+    if (!["image/svg+xml", "image/png"].includes(contentType)) {
+        throw new CanvasError("azure_devops_invalid_icon", "Azure DevOps returned an unsupported work item icon.");
+    }
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (bytes.length === 0 || bytes.length > 128 * 1024) {
+        throw new CanvasError("azure_devops_invalid_icon", "Azure DevOps returned an empty or oversized work item icon.");
+    }
+    return `data:${contentType};base64,${bytes.toString("base64")}`;
 }
 
 // Query parameters the Azure DevOps profile image endpoints actually use. The
@@ -1089,9 +1211,10 @@ const GRAPH_PROFILE_SEGMENTS = "/_apis/GraphProfile/MemberAvatars/";
 
 // Azure DevOps member descriptors are an identifier plus a base64url payload.
 const AVATAR_DESCRIPTOR = /^[A-Za-z0-9._~-]+$/;
+const ATTACHMENT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * Validates a profile image URL and rebuilds it from trusted parts.
+ * Validates an avatar or work-item attachment URL and rebuilds it from trusted parts.
  *
  * The value arrives from a query parameter on the local canvas server, so
  * everything about it is caller-controlled. Checking it and then fetching the
@@ -1099,19 +1222,23 @@ const AVATAR_DESCRIPTOR = /^[A-Za-z0-9._~-]+$/;
  * query, and fragment -- the check proves the origin and path are ours, not that
  * the rest of the URL is. So nothing from the parsed value is forwarded: the
  * organization's own origin and a literal endpoint path are used instead, and
- * the only caller-supplied pieces that survive are the avatar descriptor and a
+ * the only caller-supplied pieces that survive are validated identifiers and a
  * fixed list of query parameters, each URL-encoded on the way in.
  *
  * @param {object} config effective canvas configuration
- * @param {string} value candidate profile image URL
+ * @param {string} value candidate image URL
+ * @param {"avatar" | "attachment"} kind permitted endpoint and response bounds
  * @returns {URL}
  */
-function validateAvatarUrl(config, value) {
+function validateImageUrl(config, value, kind) {
+    const attachment = kind === "attachment";
+    const label = attachment ? "Attachment" : "Profile image";
+    const invalid = (message) => new CanvasError(`azure_devops_invalid_${kind}_url`, message);
     let candidate;
     try {
         candidate = new URL(normalizeString(value));
     } catch {
-        throw new CanvasError("azure_devops_invalid_avatar_url", "Azure DevOps returned an invalid profile image URL.");
+        throw invalid(`Azure DevOps returned an invalid ${label.toLowerCase()} URL.`);
     }
     const organizationUrl = new URL(`${parseOrganization(config.organization).baseUrl}/`);
     const organizationPath = organizationUrl.pathname.replace(/\/$/, "");
@@ -1119,25 +1246,42 @@ function validateAvatarUrl(config, value) {
     const commonIdentityPath = `${organizationPath}${COMMON_IDENTITY_SEGMENTS}`.toLowerCase();
     const graphProfilePath = `${organizationPath}${GRAPH_PROFILE_SEGMENTS}`.toLowerCase();
     if (candidate.protocol !== "https:" || candidate.origin !== organizationUrl.origin) {
-        throw new CanvasError("azure_devops_invalid_avatar_url", "Profile image URL must belong to the configured Azure DevOps organization.");
+        throw invalid(`${label} URL must belong to the configured Azure DevOps organization.`);
     }
 
     let path;
-    if (candidatePath === commonIdentityPath) {
+    let queryParameters = AVATAR_QUERY_PARAMETERS;
+    if (attachment) {
+        const segments = candidate.pathname.slice(organizationPath.length + 1).split("/");
+        const [projectId, api, area, resource, attachmentId] = segments;
+        if (
+            !candidatePath.startsWith(`${organizationPath}/`.toLowerCase()) ||
+            segments.length !== 5 ||
+            !ATTACHMENT_ID.test(projectId) ||
+            api.toLowerCase() !== "_apis" ||
+            area.toLowerCase() !== "wit" ||
+            resource.toLowerCase() !== "attachments" ||
+            !ATTACHMENT_ID.test(attachmentId)
+        ) {
+            throw invalid("Attachment URL must point at a project attachment in the configured Azure DevOps organization.");
+        }
+        path = `${organizationPath}/${projectId}/_apis/wit/attachments/${attachmentId}`;
+        queryParameters = ["fileName"];
+    } else if (candidatePath === commonIdentityPath) {
         path = `${organizationPath}${COMMON_IDENTITY_SEGMENTS}`;
     } else if (candidatePath.startsWith(graphProfilePath)) {
         // The prefixes are the same length, so slicing the original pathname at
         // the prefix length keeps the descriptor's casing, which is significant.
         const descriptor = candidate.pathname.slice(graphProfilePath.length);
         if (!AVATAR_DESCRIPTOR.test(descriptor)) {
-            throw new CanvasError("azure_devops_invalid_avatar_url", "Azure DevOps returned an invalid profile image identifier.");
+            throw invalid("Azure DevOps returned an invalid profile image identifier.");
         }
         path = `${organizationPath}${GRAPH_PROFILE_SEGMENTS}${encodeURIComponent(descriptor)}`;
     } else {
-        throw new CanvasError("azure_devops_invalid_avatar_url", "Profile image URL must belong to the configured Azure DevOps organization.");
+        throw invalid("Profile image URL must belong to the configured Azure DevOps organization.");
     }
 
-    const query = AVATAR_QUERY_PARAMETERS
+    const query = queryParameters
         .map((name) => {
             const parameter = normalizeString(candidate.searchParams.get(name));
             return parameter ? `${name}=${encodeURIComponent(parameter)}` : "";
@@ -1147,28 +1291,42 @@ function validateAvatarUrl(config, value) {
     return new URL(`${organizationUrl.origin}${path}${query ? `?${query}` : ""}`);
 }
 
-async function fetchAvatar(config, value) {
-    const avatarUrl = validateAvatarUrl(config, value);
-    const headers = await makeAuthHeaders({ Accept: "image/png,image/jpeg,image/gif,image/webp" });
-    let response = await fetch(avatarUrl, { headers, redirect: "manual" });
+function validateAvatarUrl(config, value) {
+    return validateImageUrl(config, value, "avatar");
+}
+
+function validateAttachmentUrl(config, value) {
+    return validateImageUrl(config, value, "attachment");
+}
+
+async function fetchImage(config, value, kind) {
+    const imageUrl = validateImageUrl(config, value, kind);
+    const label = kind === "attachment" ? "attachment" : "profile image";
+    const maxBytes = kind === "attachment" ? 8 * 1024 * 1024 : MAX_AVATAR_BYTES;
+    const imageTypes = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+    if (kind === "attachment") imageTypes.push("image/bmp");
+    const failure = (suffix, message) => new CanvasError(`azure_devops_${kind}_${suffix}`, message);
+    const headers = await makeAuthHeaders({ Accept: imageTypes.join(",") });
+    let response = await fetch(imageUrl, { headers, redirect: "manual" });
     if ([301, 302, 303, 307, 308].includes(response.status)) {
         const location = normalizeString(response.headers.get("location"));
         if (!location) {
-            throw new CanvasError("azure_devops_avatar_failed", "Azure DevOps profile image redirect was missing a destination.");
+            throw failure("failed", `Azure DevOps ${label} redirect was missing a destination.`);
         }
-        const redirectUrl = validateAvatarUrl(config, new URL(location, avatarUrl).href);
+        const redirectUrl = validateImageUrl(config, new URL(location, imageUrl).href, kind);
         response = await fetch(redirectUrl, { headers, redirect: "manual" });
     }
     if (!response.ok) {
-        throw new CanvasError("azure_devops_avatar_failed", `Azure DevOps profile image request failed with ${response.status}.`);
+        throw failure("failed", `Azure DevOps ${label} request failed with ${response.status}.`);
     }
     const contentType = normalizeString(response.headers.get("content-type")).split(";")[0].toLowerCase();
-    if (!["image/png", "image/jpeg", "image/gif", "image/webp"].includes(contentType)) {
-        throw new CanvasError("azure_devops_avatar_invalid_type", "Azure DevOps returned an unsupported profile image type.");
+    if (!imageTypes.includes(contentType)) {
+        throw failure("invalid_type", `Azure DevOps returned an unsupported ${label} type.`);
     }
     const contentLength = Number(response.headers.get("content-length"));
-    if (Number.isFinite(contentLength) && contentLength > MAX_AVATAR_BYTES) {
-        throw new CanvasError("azure_devops_avatar_too_large", "Azure DevOps profile image exceeded the size limit.");
+    if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+        await response.body?.cancel();
+        throw failure("too_large", `Azure DevOps ${label} exceeded the size limit.`);
     }
     const chunks = [];
     let receivedBytes = 0;
@@ -1180,15 +1338,23 @@ async function fetchAvatar(config, value) {
                 break;
             }
             receivedBytes += chunk.byteLength;
-            if (receivedBytes > MAX_AVATAR_BYTES) {
+            if (receivedBytes > maxBytes) {
                 await reader.cancel();
-                throw new CanvasError("azure_devops_avatar_too_large", "Azure DevOps profile image exceeded the size limit.");
+                throw failure("too_large", `Azure DevOps ${label} exceeded the size limit.`);
             }
             chunks.push(Buffer.from(chunk));
         }
     }
     const content = Buffer.concat(chunks, receivedBytes);
     return { content, contentType };
+}
+
+async function fetchAvatar(config, value) {
+    return fetchImage(config, value, "avatar");
+}
+
+async function fetchAttachment(config, value) {
+    return fetchImage(config, value, "attachment");
 }
 
 async function getPullRequestStatuses(config, project, repositoryId, pullRequestId) {
@@ -1621,6 +1787,30 @@ async function getPullRequestThreads(config, project, repositoryId, pullRequestI
         { apiVersion: "7.1-preview.1" },
     );
     return data.value || [];
+}
+
+function drainPullRequestCommentCountQueue() {
+    while (
+        activePullRequestCommentCountRequests < PULL_REQUEST_COMMENT_COUNT_CONCURRENCY
+        && pullRequestCommentCountQueue.length
+    ) {
+        const { run, resolve, reject } = pullRequestCommentCountQueue.shift();
+        activePullRequestCommentCountRequests += 1;
+        Promise.resolve()
+            .then(run)
+            .then(resolve, reject)
+            .finally(() => {
+                activePullRequestCommentCountRequests -= 1;
+                drainPullRequestCommentCountQueue();
+            });
+    }
+}
+
+function schedulePullRequestCommentCount(run) {
+    return new Promise((resolve, reject) => {
+        pullRequestCommentCountQueue.push({ run, resolve, reject });
+        drainPullRequestCommentCountQueue();
+    });
 }
 
 async function getPullRequestIterations(config, project, repositoryId, pullRequestId) {
@@ -2071,8 +2261,10 @@ async function getPullRequestDetails(config, project, pullRequest, repositoryOve
         getPullRequestThreads(config, project, repository.id, mappedPullRequest.id),
         getConnectionUser({ config }),
     ]);
+    const commentCounts = pullRequestCommentCounts(threads);
     return {
         ...mappedPullRequest,
+        ...commentCounts,
         policyEvaluations,
         // The action bar needs to know who "I" am to show my own vote and to
         // decide which state changes to offer, and the project id is what the
@@ -2243,7 +2435,8 @@ function pipelineRunFromBuild(build, fallback) {
         id,
         pipeline: normalizeString(build?.definition?.name) || "Pipeline run",
         name: normalizeString(build?.buildNumber) || `Build ${id}`,
-        status: normalizeString(build?.result) || normalizeString(build?.status),
+        status: normalizeString(build?.status),
+        result: normalizeString(build?.result),
         changedDate: build?.finishTime || build?.startTime || build?.queueTime || "",
         webUrl: normalizeString(build?._links?.web?.href) || fallback.webUrl,
     };
@@ -2444,8 +2637,76 @@ async function listMyPullRequests(overrides = {}) {
             $top: Math.max(1, Math.min(Number(overrides.top || DEFAULT_LIST_LIMIT), 100)),
         },
     });
-    const pullRequests = (data.value || []).map((pr) => mapPullRequest(pr, repository || pr.repository));
+    const pullRequests = await Promise.all((data.value || []).map(async (pr) => {
+        const mapped = mapPullRequest(pr, repository || pr.repository);
+        const repositoryId = normalizeString(mapped.repositoryId || pr?.repository?.id || repository?.id);
+        if (!repositoryId) {
+            void copilotSession?.log?.(
+                `Could not load comment counts for Azure DevOps pull request ${mapped.id}: the response did not include a repository.`,
+            ).catch(() => {});
+            return { ...mapped, commentCount: 0, openCommentCount: 0 };
+        }
+        const commentCounts = await getPullRequestCommentCounts(config, project, repositoryId, mapped.id);
+        return { ...mapped, ...commentCounts };
+    }));
     return { pullRequests, count: pullRequests.length, user, repository };
+}
+
+const RESOLVED_PULL_REQUEST_THREAD_STATUSES = new Set(["fixed", "closed", "bydesign", "wontfix"]);
+
+function pullRequestCommentCounts(threads) {
+    const discussions = (threads || []).filter((thread) => {
+        const comments = (thread?.comments || []).filter((comment) => !comment?.isDeleted);
+        return comments.length > 0 && !isSystemTimelineThread(thread, comments);
+    });
+    return {
+        commentCount: discussions.length,
+        openCommentCount: discussions.filter((thread) =>
+            !RESOLVED_PULL_REQUEST_THREAD_STATUSES.has(normalizeString(thread?.status).toLowerCase())).length,
+    };
+}
+
+async function getPullRequestCommentCounts(config, project, repositoryId, pullRequestId) {
+    const { baseUrl } = parseOrganization(config.organization);
+    const cacheKey = [
+        baseUrl.toLowerCase(),
+        normalizeString(project).toLowerCase(),
+        normalizeString(repositoryId).toLowerCase(),
+        Number(pullRequestId),
+    ].join("\n");
+    const cached = pullRequestCommentCountCache.get(cacheKey);
+    if (cached?.promise) {
+        return cached.promise;
+    }
+    if (cached?.expiresAt > Date.now()) {
+        return cached.value;
+    }
+    pullRequestCommentCountCache.delete(cacheKey);
+
+    const promise = schedulePullRequestCommentCount(async () => {
+        const threads = await getPullRequestThreads(config, project, repositoryId, pullRequestId);
+        return pullRequestCommentCounts(threads);
+    }).then((value) => {
+        if (pullRequestCommentCountCache.size >= PULL_REQUEST_COMMENT_COUNT_CACHE_LIMIT) {
+            pullRequestCommentCountCache.delete(pullRequestCommentCountCache.keys().next().value);
+        }
+        pullRequestCommentCountCache.set(cacheKey, {
+            expiresAt: Date.now() + PULL_REQUEST_COMMENT_COUNT_CACHE_TTL_MS,
+            value,
+        });
+        return value;
+    }).catch((error) => {
+        pullRequestCommentCountCache.delete(cacheKey);
+        if (error?.code === "azure_devops_authentication_rejected") {
+            throw error;
+        }
+        void copilotSession?.log?.(
+            `Could not load comment counts for Azure DevOps pull request ${pullRequestId}: ${error?.message || "unknown error"}`,
+        ).catch(() => {});
+        return { commentCount: 0, openCommentCount: 0 };
+    });
+    pullRequestCommentCountCache.set(cacheKey, { promise });
+    return promise;
 }
 
 function wiqlString(value) {
@@ -2495,9 +2756,30 @@ function terminalWorkItemStateFilter(workItemTypes) {
     return clauses.length ? `AND (${clauses.join(" AND ")})` : "";
 }
 
+async function getWorkItemTypeList(config, project) {
+    const { baseUrl } = parseOrganization(config.organization);
+    const cacheKey = `${baseUrl.toLowerCase()}\n${normalizeString(project).toLowerCase()}`;
+    let definitionsPromise = workItemTypeDefinitionCache.get(cacheKey);
+    if (!definitionsPromise) {
+        definitionsPromise = fetchJson(
+            config,
+            `${encodeURIComponent(project)}/_apis/wit/workitemtypes`,
+        ).then((result) => result.value || []);
+        workItemTypeDefinitionCache.set(cacheKey, definitionsPromise);
+    }
+    try {
+        return await definitionsPromise;
+    } catch (error) {
+        if (workItemTypeDefinitionCache.get(cacheKey) === definitionsPromise) {
+            workItemTypeDefinitionCache.delete(cacheKey);
+        }
+        throw error;
+    }
+}
+
 async function getWorkItemTypeDefinitions(config, project) {
-    const result = await fetchJson(config, `${encodeURIComponent(project)}/_apis/wit/workitemtypes`);
-    return Promise.all((result.value || []).map(async (workItemType) => {
+    const workItemTypes = await getWorkItemTypeList(config, project);
+    return Promise.all(workItemTypes.map(async (workItemType) => {
         if (Array.isArray(workItemType?.states) && workItemType.states.length) {
             return workItemType;
         }
@@ -2517,10 +2799,8 @@ async function getWorkItemTypeAppearances(config, project) {
     const cacheKey = `${baseUrl.toLowerCase()}\n${normalizeString(project).toLowerCase()}`;
     let appearancesPromise = workItemTypeAppearanceCache.get(cacheKey);
     if (!appearancesPromise) {
-        appearancesPromise = fetchJson(
-            config,
-            `${encodeURIComponent(project)}/_apis/wit/workitemtypes`,
-        ).then((result) => new Map((result.value || [])
+        appearancesPromise = getWorkItemTypeList(config, project)
+            .then((definitions) => new Map(definitions
             .map((definition) => [normalizeString(definition?.name).toLowerCase(), definition])
             .filter(([name]) => name)));
         workItemTypeAppearanceCache.set(cacheKey, appearancesPromise);
@@ -2533,19 +2813,105 @@ async function getWorkItemTypeAppearances(config, project) {
     }
 }
 
+function drainWorkItemTypeIconQueue() {
+    while (
+        activeWorkItemTypeIconRequests < WORK_ITEM_TYPE_ICON_CONCURRENCY
+        && workItemTypeIconQueue.length
+    ) {
+        const { run, resolve, reject } = workItemTypeIconQueue.shift();
+        activeWorkItemTypeIconRequests += 1;
+        Promise.resolve()
+            .then(run)
+            .then(resolve, reject)
+            .finally(() => {
+                activeWorkItemTypeIconRequests -= 1;
+                drainWorkItemTypeIconQueue();
+            });
+    }
+}
+
+function scheduleWorkItemTypeIcon(run) {
+    return new Promise((resolve, reject) => {
+        workItemTypeIconQueue.push({ run, resolve, reject });
+        drainWorkItemTypeIconQueue();
+    });
+}
+
+async function getWorkItemTypeIconData(config, appearances, typeNames) {
+    const requested = [...new Set(typeNames.map((name) => normalizeString(name).toLowerCase()).filter(Boolean))];
+    const entries = await Promise.all(requested.map(async (name) => {
+        const definition = appearances.get(name);
+        const iconId = normalizeString(definition?.icon?.id);
+        const color = normalizeString(definition?.color).replace(/^#/, "");
+        if (!/^icon_[a-z0-9_]+$/i.test(iconId) || !/^[0-9a-f]{6}$/i.test(color)) {
+            return null;
+        }
+        const cacheKey = [
+            parseOrganization(config.organization).baseUrl.toLowerCase(),
+            iconId.toLowerCase(),
+            color.toLowerCase(),
+        ].join("|");
+        let iconPromise = workItemTypeIconCache.get(cacheKey);
+        if (!iconPromise) {
+            iconPromise = scheduleWorkItemTypeIcon(() => fetchImageDataUri(
+                config,
+                `_apis/wit/workItemIcons/${encodeURIComponent(iconId)}`,
+                { params: { color, v: 2 } },
+            ));
+            if (workItemTypeIconCache.size >= WORK_ITEM_TYPE_ICON_CACHE_LIMIT) {
+                workItemTypeIconCache.delete(workItemTypeIconCache.keys().next().value);
+            }
+            workItemTypeIconCache.set(cacheKey, iconPromise);
+        }
+        try {
+            return [name, await iconPromise];
+        } catch (error) {
+            if (workItemTypeIconCache.get(cacheKey) === iconPromise) {
+                workItemTypeIconCache.delete(cacheKey);
+            }
+            void copilotSession?.log?.(
+                `Could not load the ${normalizeString(definition?.name) || name} work-item type icon: ${error?.message || "unknown error"}`,
+            ).catch(() => {});
+            return null;
+        }
+    }));
+    return new Map(entries.filter(Boolean));
+}
+
 async function mapWorkItemSummaries(config, project, workItems) {
     let appearances = new Map();
     try {
         appearances = await getWorkItemTypeAppearances(config, project);
     } catch (error) {
-        await copilotSession?.log?.(
+        if (error?.code === "azure_devops_authentication_rejected") {
+            throw error;
+        }
+        void copilotSession?.log?.(
             `Could not load Azure DevOps work-item type colors: ${error?.message || "unknown error"}`,
-        );
+        ).catch(() => {});
     }
+    const types = workItems.map((workItem) => workItem?.fields?.["System.WorkItemType"]);
+    const icons = await getWorkItemTypeIconData(config, appearances, types);
     return workItems.map((workItem) => {
         const type = normalizeString(workItem?.fields?.["System.WorkItemType"]).toLowerCase();
-        return mapWorkItem(workItem, appearances.get(type));
+        return {
+            ...mapWorkItem(workItem, appearances.get(type)),
+            typeIcon: icons.get(type) || "",
+        };
     });
+}
+
+async function mapWorkItemSummariesByProject(config, workItems) {
+    const groups = new Map();
+    for (const workItem of workItems) {
+        const project = normalizeString(workItem?.fields?.["System.TeamProject"]);
+        if (!project) continue;
+        groups.set(project, [...(groups.get(project) || []), workItem]);
+    }
+    const mappedGroups = await Promise.all([...groups].map(async ([project, items]) =>
+        mapWorkItemSummaries(config, project, items)));
+    const byId = new Map(mappedGroups.flat().map((item) => [Number(item.id), item]));
+    return workItems.map((item) => byId.get(Number(item.id)) || mapWorkItem(item));
 }
 
 async function getTerminalWorkItemStates(config, project) {
@@ -2611,7 +2977,10 @@ async function filterOpenWorkItems(config, workItems, top) {
     await Promise.all(projects.map(async (project) => {
         try {
             states.set(project.toLowerCase(), await getTerminalWorkItemStates(config, project));
-        } catch {
+        } catch (error) {
+            if (error?.code === "azure_devops_authentication_rejected") {
+                throw error;
+            }
             // A project whose definitions cannot be read is left unfiltered rather
             // than dropped: showing a closed item is a smaller failure than hiding
             // an open one.
@@ -2665,7 +3034,10 @@ async function queryMyOpenOrganizationWorkItems(config, top) {
             ].join(","),
         },
     });
-    const workItems = await filterOpenWorkItems(config, (details.value || []).map(mapWorkItem), top);
+    const detailsById = new Map((details.value || []).map((item) => [Number(item.id), item]));
+    const open = await filterOpenWorkItems(config, (details.value || []).map(mapWorkItem), top);
+    const selected = open.map((item) => detailsById.get(Number(item.id))).filter(Boolean);
+    const workItems = await mapWorkItemSummariesByProject(config, selected);
     return { workItems, count: workItems.length };
 }
 
@@ -2705,13 +3077,305 @@ async function queryMyOpenProjectWorkItems(config, project, top) {
             ].join(","),
         },
     });
-    const workItems = byMostRecentlyChanged((details.value || []).map(mapWorkItem));
+    const workItems = byMostRecentlyChanged(await mapWorkItemSummaries(config, project, details.value || []));
     return { workItems, count: workItems.length };
+}
+
+function favoriteBoardLink(favorite) {
+    return normalizeString(
+        favorite?._links?.page?.href
+        || favorite?._links?.web?.href
+        || favorite?.artifactProperties?.url
+        || favorite?.url,
+    );
+}
+
+function mapFavoriteBoard(favorite, config) {
+    const href = favoriteBoardLink(favorite);
+    if (!href) {
+        return null;
+    }
+    const parsedOrganization = parseOrganization(config.organization);
+    let url;
+    try {
+        url = new URL(href, `${parsedOrganization.baseUrl}/`);
+    } catch {
+        return null;
+    }
+    const expected = new URL(`${parsedOrganization.baseUrl}/`);
+    if (url.origin.toLowerCase() !== expected.origin.toLowerCase()) {
+        return null;
+    }
+    let parts;
+    let expectedPrefix;
+    try {
+        parts = url.pathname.split("/").filter(Boolean).map((part) => decodeURIComponent(part));
+        expectedPrefix = expected.pathname.split("/").filter(Boolean).map((part) => decodeURIComponent(part));
+    } catch {
+        return null;
+    }
+    if (!expectedPrefix.every((part, index) => part.toLowerCase() === parts[index]?.toLowerCase())) {
+        return null;
+    }
+    const projectIndex = expectedPrefix.length;
+    const boardIndex = parts.findIndex((part) => part.toLowerCase() === "_boards");
+    const teamIndex = parts.findIndex((part) => part.toLowerCase() === "t");
+    if (boardIndex !== projectIndex + 1 || teamIndex < 0 || teamIndex + 1 >= parts.length) {
+        return null;
+    }
+    const project = parts[projectIndex] || "";
+    if (!project || project.toLowerCase() !== normalizeString(config.project).toLowerCase()) {
+        return null;
+    }
+    const team = parts[teamIndex + 1] || "";
+    const boardId = parts[teamIndex + 2] || "";
+    if (!team) {
+        return null;
+    }
+    return {
+        id: normalizeString(favorite?.id) || normalizeString(favorite?.artifactId) || href,
+        artifactId: normalizeString(favorite?.artifactId),
+        name: normalizeString(favorite?.artifactName) || boardId || team,
+        organization: config.organization,
+        project: config.project,
+        team,
+        boardId,
+        backlogLevel: boardId,
+        url: url.toString(),
+    };
+}
+
+async function listFavoriteBoards(overrides = {}) {
+    const config = await getEffectiveConfig(overrides);
+    const project = normalizeString(config.project);
+    if (!project) {
+        return { boards: [], count: 0, requiresProject: true };
+    }
+    const loadFavorites = (artifactType = "") => fetchJson(config, "_apis/favorite/favorites", {
+        apiVersion: "7.1-preview.1",
+        params: {
+            artifactType,
+            artifactScopeType: "Project",
+            includeExtendedDetails: true,
+        },
+    });
+    const mapBoards = (favorites) => (favorites || [])
+        .filter((favorite) => !favorite?.artifactIsDeleted)
+        .filter((favorite) => {
+            const scope = favorite?.artifactScope || {};
+            return !scope.name || normalizeString(scope.name).toLowerCase() === project.toLowerCase();
+        })
+        .map((favorite) => mapFavoriteBoard(favorite, config))
+        .filter(Boolean)
+        .sort((left, right) => left.name.localeCompare(right.name));
+    const typed = await loadFavorites(FAVORITE_BOARD_ARTIFACT_TYPE);
+    let boards = mapBoards(typed.value);
+    let otherProjectBoardCount = 0;
+    if (!boards.length) {
+        const allProjectFavorites = await loadFavorites();
+        boards = mapBoards(allProjectFavorites.value);
+        const boardLinkFavorites = (allProjectFavorites.value || []).filter((favorite) =>
+            favoriteBoardLink(favorite).toLowerCase().includes("/_boards/"));
+        const boardLinkCount = boardLinkFavorites.length;
+        otherProjectBoardCount = Math.max(0, boardLinkCount - boards.length);
+    }
+    return { boards, count: boards.length, otherProjectBoardCount, requiresProject: false };
+}
+
+function boardApiPath(target, suffix) {
+    return `${encodeURIComponent(target.project)}/${encodeURIComponent(target.team)}/_apis/work/${suffix}`;
+}
+
+function boardWorkItemPath(target, id = "") {
+    const suffix = id ? `/${encodeURIComponent(id)}` : "";
+    return `${encodeURIComponent(target.project)}/_apis/wit/workitems${suffix}`;
+}
+
+function boardReferencePriority(board) {
+    const name = normalizeString(board?.name).toLowerCase();
+    const tokens = new Set(name.split(/[^a-z0-9]+/).filter(Boolean));
+    const hasToken = (...values) => values.some((value) => tokens.has(value));
+    if (["stories", "backlog items", "requirements"].includes(name)) {
+        return 0;
+    }
+    if (hasToken("story", "stories", "backlog", "requirement", "requirements")) {
+        return 1;
+    }
+    if (!hasToken("epic", "epics", "feature", "features", "task", "tasks")) {
+        return 2;
+    }
+    if (hasToken("task", "tasks")) {
+        return 3;
+    }
+    if (hasToken("feature", "features")) {
+        return 4;
+    }
+    return 5;
+}
+
+async function fetchBoardMetadata(config, target) {
+    let boardId = normalizeString(target.boardId);
+    if (!boardId) {
+        const data = await fetchJson(config, boardApiPath(target, "boards"));
+        const references = [...(data.value || [])].filter((board) => board?.id || board?.name);
+        references.sort((left, right) =>
+            boardReferencePriority(left) - boardReferencePriority(right)
+            || normalizeString(left?.name).localeCompare(normalizeString(right?.name)));
+        boardId = normalizeString(references[0]?.id) || normalizeString(references[0]?.name);
+    }
+    if (!boardId) {
+        throw new CanvasError("azure_devops_board_unavailable", "Azure DevOps returned no boards for this team.");
+    }
+    return fetchJson(config, boardApiPath(target, `boards/${encodeURIComponent(boardId)}`));
+}
+
+async function fetchBoardWorkItems(config, target) {
+    const backlogResults = await Promise.allSettled(
+        BOARD_BACKLOG_CATEGORY_IDS.map((backlogId) => fetchJson(
+            config,
+            boardApiPath(target, `backlogs/${encodeURIComponent(backlogId)}/workItems`),
+        )),
+    );
+    const fulfilled = backlogResults.filter((result) => result.status === "fulfilled");
+    if (!fulfilled.length) {
+        throw backlogResults[0]?.reason || new Error("Azure DevOps could not read this board's backlog.");
+    }
+    const ids = [...new Set(fulfilled.flatMap((result) =>
+        (result.value?.workItems || [])
+            .map((item) => item?.target?.id ?? item?.id)
+            .filter((id) => Number.isInteger(Number(id)))
+            .map(Number),
+    ))];
+    if (!ids.length) {
+        return [];
+    }
+    const items = [];
+    for (let index = 0; index < ids.length; index += 200) {
+        const data = await fetchJson(config, `${encodeURIComponent(target.project)}/_apis/wit/workitemsbatch`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                ids: ids.slice(index, index + 200),
+                fields: BOARD_CARD_FIELDS,
+            }),
+        });
+        items.push(...(data.value || []));
+    }
+    return items;
+}
+
+async function createBoardDataProvider(overrides, target) {
+    const config = await getEffectiveConfig({
+        ...overrides,
+        organization: target.organization,
+        project: target.project,
+        repositoryId: "",
+    });
+    const scopedTarget = {
+        ...target,
+        org: config.organization,
+        project: config.project,
+    };
+    return {
+        name: "canvas-rest",
+        label: "Azure DevOps canvas",
+        async fetchAllItems() {
+            const [board, items] = await Promise.all([
+                fetchBoardMetadata(config, scopedTarget),
+                fetchBoardWorkItems(config, scopedTarget),
+            ]);
+            return {
+                items,
+                columns: (board.columns || []).map((column) => ({
+                    name: normalizeString(column?.name),
+                    mappings: column?.stateMappings || {},
+                    columnType: column?.columnType || null,
+                })).filter((column) => column.name),
+            };
+        },
+        async fetchItemDetail(id, { includeComments = true } = {}) {
+            const itemPromise = fetchJson(config, boardWorkItemPath(scopedTarget, id), {
+                params: includeComments ? { $expand: "All" } : { fields: BOARD_CARD_FIELDS.join(",") },
+            });
+            const commentsPromise = includeComments
+                ? fetchJson(
+                    config,
+                    `${encodeURIComponent(scopedTarget.project)}/_apis/wit/workItems/${encodeURIComponent(id)}/comments`,
+                    { apiVersion: "7.1-preview.4", params: { $top: 50 } },
+                ).catch(() => ({ comments: [] }))
+                : Promise.resolve({ comments: [] });
+            const [item, comments] = await Promise.all([itemPromise, commentsPromise]);
+            return {
+                ok: true,
+                item,
+                comments: comments.comments || comments.value || [],
+                browseUrl: item?._links?.html?.href || `${target.url.split("/_boards/")[0]}/_workitems/edit/${id}`,
+            };
+        },
+        async getWorkItem(id) {
+            return fetchJson(config, boardWorkItemPath(scopedTarget, id), {
+                params: { fields: BOARD_CARD_FIELDS.join(",") },
+            });
+        },
+        async getWorkItemType(workItemType) {
+            return fetchJson(
+                config,
+                `${encodeURIComponent(scopedTarget.project)}/_apis/wit/workitemtypes/${encodeURIComponent(workItemType)}`,
+            );
+        },
+        async fetchWorkItemTypeIcons(typeNames = []) {
+            const appearances = await getWorkItemTypeAppearances(config, scopedTarget.project);
+            const icons = await getWorkItemTypeIconData(config, appearances, typeNames);
+            return Object.fromEntries(typeNames
+                .map((name) => [normalizeString(name), icons.get(normalizeString(name).toLowerCase())])
+                .filter(([, icon]) => icon));
+        },
+        async updateItemState(id, state) {
+            const item = await fetchJson(config, boardWorkItemPath(scopedTarget, id), {
+                method: "PATCH",
+                headers: { "Content-Type": "application/json-patch+json" },
+                body: JSON.stringify([{ op: "replace", path: "/fields/System.State", value: state }]),
+            });
+            return { ok: true, state: item?.fields?.["System.State"] || state };
+        },
+        async addItemComment(id, text) {
+            const comment = await fetchJson(
+                config,
+                `${encodeURIComponent(scopedTarget.project)}/_apis/wit/workItems/${encodeURIComponent(id)}/comments`,
+                {
+                    method: "POST",
+                    apiVersion: "7.1-preview.4",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ text }),
+                },
+            );
+            return { ok: true, comment };
+        },
+        async createWorkItem(type, title, state) {
+            const patch = [{ op: "add", path: "/fields/System.Title", value: title }];
+            if (state) {
+                patch.push({ op: "add", path: "/fields/System.State", value: state });
+            }
+            const item = await fetchJson(
+                config,
+                `${encodeURIComponent(scopedTarget.project)}/_apis/wit/workitems/$${encodeURIComponent(type)}`,
+                {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json-patch+json" },
+                    body: JSON.stringify(patch),
+                },
+            );
+            return { ok: true, item };
+        },
+    };
 }
 
 function homeSection(result, fallback) {
     if (result.status === "fulfilled") {
         return { ...fallback, ...result.value, error: "" };
+    }
+    if (result.reason?.code === "azure_devops_authentication_rejected") {
+        throw result.reason;
     }
     return {
         ...fallback,
@@ -2727,10 +3391,13 @@ async function getConnectionOverview(connection, overrides = {}) {
     const config = await getEffectiveConfig(scoped);
     const project = normalizeString(config.project);
     const top = Math.max(1, Math.min(Number(overrides.top || HOME_LIST_LIMIT), 50));
-    const [pullRequestResult, workItemResult] = await Promise.allSettled([
+    const [pullRequestResult, boardResult, workItemResult] = await Promise.allSettled([
         project
             ? listMyPullRequests({ ...scoped, status: DEFAULT_STATUS, top })
             : Promise.resolve({ pullRequests: [], count: 0, requiresProject: true }),
+        overrides.featureFlags?.boards && project
+            ? listFavoriteBoards(scoped)
+            : Promise.resolve({ boards: [], count: 0, requiresProject: true }),
         queryMyOpenWorkItems({ ...scoped, top }),
     ]);
     const pullRequests = homeSection(pullRequestResult, { pullRequests: [], count: 0 });
@@ -2749,6 +3416,10 @@ async function getConnectionOverview(connection, overrides = {}) {
         myPullRequests: {
             ...pullRequests,
             scope: normalizeString(pullRequests.repository?.name) || config.repositoryId || project,
+        },
+        myBoards: {
+            ...homeSection(boardResult, { boards: [], count: 0 }),
+            scope: project,
         },
         myWorkItems: {
             ...homeSection(workItemResult, { workItems: [], count: 0 }),
@@ -3842,21 +4513,9 @@ async function fetchVsspsJson(path, params = {}) {
             url.searchParams.set(key, String(value));
         }
     }
-    const response = await fetch(url, { headers: await makeAuthHeaders() });
-    const text = await response.text();
-    let data = {};
-    if (text) {
-        try {
-            data = JSON.parse(text);
-        } catch {
-            data = { message: text };
-        }
-    }
-    if (!response.ok) {
-        const message = data?.message || data?.error?.message || response.statusText || "Azure DevOps request failed.";
-        throw new CanvasError("azure_devops_request_failed", `${response.status} ${message}`);
-    }
-    return data;
+    const token = await getRequestToken();
+    const response = await fetch(url, { headers: authHeaders(token) });
+    return readAzureDevOpsJson(response, token);
 }
 
 // Two calls: the profile resolves the member id that the accounts call filters
@@ -3880,6 +4539,11 @@ async function listOrganizations() {
             .sort((left, right) => left.name.localeCompare(right.name));
         return { organizations, error: "" };
     } catch (error) {
+        // A refused sign-in is not a refused accounts call: the token has been
+        // dropped, so the canvas has to go back to sign-in rather than free text.
+        if (error?.code === "azure_devops_authentication_rejected") {
+            throw error;
+        }
         return { organizations: [], error: normalizeString(error?.message) || "Could not list Azure DevOps organizations." };
     }
 }
@@ -3982,6 +4646,12 @@ const staticContentTypes = {
 };
 
 function staticAssetPath(pathname) {
+    // The UI imports this DOM-free shared module. Keep it explicit so static
+    // routing does not expose the rest of the extension directory.
+    if (pathname === "/common.mjs") {
+        return BROWSER_COMMON_MODULE_PATH;
+    }
+
     const requestedPath = pathname === "/" ? "index.html" : pathname.replace(/^\/ui\//, "");
     if (pathname !== "/" && !pathname.startsWith("/ui/")) {
         return null;
@@ -4022,14 +4692,141 @@ function staticAsset(res, pathname) {
     }
 }
 
-async function readRequestBody(req) {
+function hasPathTraversal(pathname) {
+    try {
+        return decodeURIComponent(pathname)
+            .split("/")
+            .some((segment) => segment === "." || segment === "..");
+    } catch {
+        return true;
+    }
+}
+
+function localBoardUrl(value) {
+    try {
+        const url = new URL(value);
+        if (
+            url.protocol !== "http:" ||
+            url.hostname !== "127.0.0.1" ||
+            !/^\d+$/.test(url.port) ||
+            /^http:\/\/[^/?#]*@/i.test(url.href) ||
+            url.pathname !== "/"
+        ) {
+            return null;
+        }
+        return url;
+    } catch {
+        return null;
+    }
+}
+
+function staticBoardProxyPath(pathname) {
+    switch (pathname) {
+    case "/auth-probe": return "/auth-probe";
+    case "/azdo-config": return "/azdo-config";
+    case "/azdo-projects": return "/azdo-projects";
+    case "/cloud-config": return "/cloud-config";
+    case "/comment": return "/comment";
+    case "/complete-run": return "/complete-run";
+    case "/connection-check": return "/connection-check";
+    case "/copy-to-clipboard": return "/copy-to-clipboard";
+    case "/create": return "/create";
+    case "/data.json": return "/data.json";
+    case "/debug-log": return "/debug-log";
+    case "/delegate": return "/delegate";
+    case "/delegate-local": return "/delegate-local";
+    case "/local-config": return "/local-config";
+    case "/diagnostics": return "/diagnostics";
+    case "/refresh": return "/refresh";
+    case "/run-status": return "/run-status";
+    case "/state": return "/state";
+    case "/type-icons.json": return "/type-icons.json";
+    default: return null;
+    }
+}
+
+function boardProxyRoute(entry, pathname, rawPathname = pathname) {
+    if (hasPathTraversal(rawPathname)) {
+        return null;
+    }
+    const match = pathname.match(/^\/boards\/([A-Za-z0-9_-]+)(\/.*)?$/);
+    if (!match) {
+        return null;
+    }
+    const board = entry.boards.get(match[1]);
+    const targetPath = match[2] || "/";
+    const boardUrl = localBoardUrl(board?.url);
+    if (!board || !boardUrl) {
+        return null;
+    }
+    const itemMatch = /^\/item\/([1-9]\d*)\/?$/.exec(targetPath);
+    if (itemMatch) {
+        return { board, boardUrl, targetPath: `/item/${encodeURIComponent(itemMatch[1])}` };
+    }
+    if (targetPath === "/") {
+        return { board, boardUrl, targetPath: "/" };
+    }
+    const staticPath = staticBoardProxyPath(targetPath);
+    return staticPath ? { board, boardUrl, targetPath: staticPath } : null;
+}
+
+function validateBoardProxyRequest(route, req) {
+    if (req.method === "GET" && route.targetPath === "/") {
+        return;
+    }
+    const actualNonce = headerValue(req.headers["x-canvas-nonce"]);
+    if (!route.board.apiNonce || actualNonce !== route.board.apiNonce) {
+        throw new CanvasError("azure_devops_invalid_nonce", "Rejected board request with invalid API nonce.");
+    }
+}
+
+async function proxyBoardRequest(entry, req, res, url) {
+    validateApiRequest(entry, req, { requireNonce: false });
+    const rawPathname = (req.url || "").split("?", 1)[0];
+    const route = boardProxyRoute(entry, url.pathname, rawPathname);
+    if (!route) {
+        notFound(res);
+        return;
+    }
+    if (url.search) {
+        notFound(res);
+        return;
+    }
+    validateBoardProxyRequest(route, req);
+    const target = new URL(route.targetPath, route.boardUrl);
+    const headers = {};
+    for (const name of ["accept", "content-type", "x-canvas-nonce"]) {
+        const value = headerValue(req.headers[name]);
+        if (value) headers[name] = value;
+    }
+    const method = req.method || "GET";
+    const parsedBody = method === "GET" || method === "HEAD"
+        ? undefined
+        : await readRequestBody(req, { allowEmpty: true });
+    const body = parsedBody === undefined ? undefined : JSON.stringify(parsedBody);
+    const response = await fetch(target, {
+        method,
+        headers,
+        body,
+        redirect: "manual",
+    });
+    const content = Buffer.from(await response.arrayBuffer());
+    res.writeHead(response.status, {
+        "Content-Type": response.headers.get("content-type") || "application/octet-stream",
+        "Content-Length": content.length,
+        "Cache-Control": "no-store",
+    });
+    res.end(content);
+}
+
+async function readRequestBody(req, { allowEmpty = false } = {}) {
     const chunks = [];
     for await (const chunk of req) {
         chunks.push(chunk);
     }
     const raw = Buffer.concat(chunks).toString("utf8");
     if (!raw) {
-        return {};
+        return allowEmpty ? undefined : {};
     }
     try {
         return JSON.parse(raw);
@@ -4076,6 +4873,14 @@ function connectionSelector(url) {
     };
 }
 
+function pullRequestRouteOverrides(connection, url) {
+    return {
+        ...connectionOverrides(connection),
+        project: normalizeString(url.searchParams.get("pullRequestProject")) || connection.project,
+        repositoryId: normalizeString(url.searchParams.get("pullRequestRepositoryId")),
+    };
+}
+
 // The pull request action routes differ only in the operation they run, so the
 // reference, connection, and body plumbing is resolved once here. The id always
 // comes from the path rather than the body: a request cannot retarget itself.
@@ -4090,8 +4895,7 @@ async function pullRequestAction(entry, req, url, operation) {
         id,
         pullRequestId: id,
         pullRequestUrl: "",
-        ...connectionOverrides(connection),
-        repositoryId: "",
+        ...pullRequestRouteOverrides(connection, url),
     });
 }
 
@@ -4110,8 +4914,7 @@ async function pullRequestThreadAction(entry, req, url, operation) {
         pullRequestId: id,
         pullRequestUrl: "",
         threadId,
-        ...connectionOverrides(connection),
-        repositoryId: "",
+        ...pullRequestRouteOverrides(connection, url),
     });
 }
 
@@ -4145,21 +4948,36 @@ async function handleApi(entry, req, res, url) {
                     pullRequestReference: hasPullRequestReference(entry.input),
                     workItemReference: hasWorkItemReference(entry.input),
                     extensionVersion: EXTENSION_VERSION,
+                    featureFlags: entry.featureFlags,
                 },
             });
             return;
         }
-        if (req.method === "GET" && url.pathname === "/api/avatar") {
+        if (req.method === "POST" && url.pathname === "/api/feature-flags") {
+            validateApiRequest(entry, req);
+            const body = await readRequestBody(req);
+            const featureFlags = normalizeFeatureFlags(body);
+            if (entry.featureFlags.boards && !featureFlags.boards) {
+                await entry.closeBoards();
+            }
+            entry.featureFlags = featureFlags;
+            jsonResponse(res, 200, { featureFlags: entry.featureFlags });
+            return;
+        }
+        if (req.method === "GET" && ["/api/avatar", "/api/attachment"].includes(url.pathname)) {
+            const kind = url.pathname === "/api/attachment" ? "attachment" : "avatar";
+            const label = kind === "attachment" ? "Attachment" : "Profile image";
             validateApiRequest(entry, req, { requireNonce: false });
             if (url.searchParams.get("nonce") !== entry.apiNonce) {
-                throw new CanvasError("azure_devops_invalid_nonce", "Rejected profile image request with invalid API nonce.");
+                throw new CanvasError("azure_devops_invalid_nonce", `Rejected ${label.toLowerCase()} request with invalid API nonce.`);
             }
-            const avatarUrl = normalizeString(url.searchParams.get("url"));
-            if (!avatarUrl) {
-                throw new CanvasError("azure_devops_invalid_avatar_request", "Profile image request is missing the Azure DevOps image URL.");
+            const imageUrl = normalizeString(url.searchParams.get("url"));
+            if (!imageUrl) {
+                throw new CanvasError(`azure_devops_invalid_${kind}_request`, `${label} request is missing the Azure DevOps image URL.`);
             }
-            const config = await getEffectiveConfig(entry.input);
-            imageResponse(res, await fetchAvatar(config, avatarUrl));
+            const connection = await requireConnection(entry.input, connectionSelector(url));
+            const config = await getEffectiveConfig({ ...entry.input, ...connectionOverrides(connection) });
+            imageResponse(res, await fetchImage(config, imageUrl, kind));
             return;
         }
         validateApiRequest(entry, req);
@@ -4227,7 +5045,76 @@ async function handleApi(entry, req, res, url) {
             jsonResponse(res, 200, await getHomeOverview({
                 ...entry.input,
                 top: url.searchParams.get("top") || undefined,
+                featureFlags: entry.featureFlags,
             }));
+            return;
+        }
+        if (req.method === "POST" && url.pathname === "/api/boards/open") {
+            if (!entry.featureFlags.boards) {
+                throw new CanvasError("azure_devops_boards_disabled", "Azure Boards is disabled.");
+            }
+            if (!entry.openBoard) {
+                throw new CanvasError("azure_devops_board_unavailable", "Board views are not available in this canvas.");
+            }
+            const body = await readRequestBody(req);
+            const connection = await requireConnection(entry.input, {
+                organization: normalizeString(body.organization),
+                project: normalizeString(body.project),
+            });
+            if (!connection.project) {
+                throw new CanvasError("azure_devops_missing_project", "Choose an Azure DevOps project before opening a board.");
+            }
+            const favorites = await listFavoriteBoards({
+                ...entry.input,
+                ...connectionOverrides(connection),
+            });
+            const board = favorites.boards.find((candidate) => candidate.id === normalizeString(body.id));
+            if (!board) {
+                throw new CanvasError("azure_devops_unknown_board", "The selected board is no longer a favorite in this project.");
+            }
+            const key = [
+                connection.organization.toLowerCase(),
+                connection.project.toLowerCase(),
+                board.id,
+            ].join("/");
+            const existing = [...entry.boards.entries()].find(([, value]) => value.key === key);
+            if (existing) {
+                jsonResponse(res, 200, {
+                    board,
+                    token: existing[0],
+                    path: `/boards/${existing[0]}/`,
+                });
+                return;
+            }
+            const token = base64Url(randomBytes(12));
+            const pathPrefix = `/boards/${token}`;
+            const provider = await createBoardDataProvider(entry.input, board);
+            const opened = await entry.openBoard({
+                board,
+                connection,
+                dataProvider: provider,
+                pathPrefix,
+            });
+            entry.boards.set(token, {
+                ...opened,
+                key,
+                url: normalizeString(opened?.url),
+            });
+            if (!entry.boards.get(token)?.url) {
+                entry.boards.delete(token);
+                throw new CanvasError("azure_devops_board_unavailable", "The selected board did not provide a view.");
+            }
+            jsonResponse(res, 200, { board, token, path: `${pathPrefix}/` });
+            return;
+        }
+        if (req.method === "DELETE" && /^\/api\/boards\/[A-Za-z0-9_-]+$/.test(url.pathname)) {
+            const token = url.pathname.split("/").pop();
+            const board = entry.boards.get(token);
+            if (board) {
+                entry.boards.delete(token);
+                await entry.closeBoard?.(board);
+            }
+            jsonResponse(res, 200, { closed: Boolean(board) });
             return;
         }
         if (req.method === "GET" && /^\/api\/pull-requests\/\d+$/.test(url.pathname)) {
@@ -4238,8 +5125,7 @@ async function handleApi(entry, req, res, url) {
                 id,
                 pullRequestId: id,
                 pullRequestUrl: "",
-                ...connectionOverrides(connection),
-                repositoryId: "",
+                ...pullRequestRouteOverrides(connection, url),
             }));
             return;
         }
@@ -4253,8 +5139,7 @@ async function handleApi(entry, req, res, url) {
                 id,
                 pullRequestId: id,
                 pullRequestUrl: "",
-                ...connectionOverrides(connection),
-                repositoryId: "",
+                ...pullRequestRouteOverrides(connection, url),
             }));
             return;
         }
@@ -4358,6 +5243,50 @@ async function handleApi(entry, req, res, url) {
             }));
             return;
         }
+        if (req.method === "POST" && /^\/api\/work-items\/\d+\/delegate$/.test(url.pathname)) {
+            if (!entry.featureFlags.delegation) {
+                throw new CanvasError("azure_devops_delegation_disabled", "Work item delegation is disabled.");
+            }
+            if (!entry.delegateWorkItem) {
+                throw new CanvasError("azure_devops_delegation_unavailable", "Work item delegation is not available in this canvas.");
+            }
+            const id = Number(url.pathname.split("/").at(-2));
+            const body = await readRequestBody(req);
+            const mode = normalizeString(body.mode).toLowerCase();
+            if (mode !== "local" && mode !== "cloud") {
+                throw new CanvasError("azure_devops_invalid_delegation_mode", "Choose local or cloud delegation.");
+            }
+            const connection = await requireConnection(entry.input, connectionSelector(url));
+            const project = normalizeString(url.searchParams.get("workItemProject")) || connection.project;
+            if (!project) {
+                throw new CanvasError("azure_devops_missing_project", "The work item's Azure DevOps project is required for delegation.");
+            }
+            const scopedConnection = { ...connection, project };
+            const workItem = await getWorkItemDetails({
+                ...entry.input,
+                id,
+                workItemId: id,
+                workItemUrl: "",
+                ...connectionOverrides(scopedConnection),
+            });
+            const target = {
+                organization: scopedConnection.organization,
+                org: scopedConnection.organization,
+                project,
+                team: `${project} Team`,
+                backlogLevel: "",
+                url: `${parseOrganization(scopedConnection.organization).baseUrl}/${encodePathPart(project)}`,
+            };
+            const dataProvider = await createBoardDataProvider(entry.input, target);
+            jsonResponse(res, 200, await entry.delegateWorkItem({
+                connection: scopedConnection,
+                dataProvider,
+                force: body.force === true,
+                item: workItem,
+                mode,
+            }));
+            return;
+        }
         if (req.method === "GET" && /^\/api\/work-items\/\d+\/details$/.test(url.pathname)) {
             const connection = await requireConnection(entry.input, connectionSelector(url));
             const id = Number(url.pathname.split("/").at(-2));
@@ -4408,8 +5337,7 @@ async function handleApi(entry, req, res, url) {
                 id,
                 pullRequestId: id,
                 pullRequestUrl: "",
-                ...connectionOverrides(connection),
-                repositoryId: "",
+                ...pullRequestRouteOverrides(connection, url),
             });
             await requestCommentFix(pullRequest, body.threadId, body.commentId);
             jsonResponse(res, 200, { queued: true });
@@ -4442,15 +5370,37 @@ async function handleApi(entry, req, res, url) {
 }
 
 
-export async function startServer(instanceId, input) {
+export async function startServer(instanceId, input, { openBoard, closeBoard, delegateWorkItem } = {}) {
     const entry = {
         input: input || {},
         apiNonce: base64Url(randomBytes(24)),
+        boards: new Map(),
+        openBoard,
+        closeBoard,
+        delegateWorkItem,
+        featureFlags: { ...DEFAULT_FEATURE_FLAGS },
     };
     const server = createServer(async (req, res) => {
         const url = new URL(req.url || "/", entry.url || "http://127.0.0.1/");
         if (url.pathname.startsWith("/api/")) {
             await handleApi(entry, req, res, url);
+            return;
+        }
+        if (url.pathname.startsWith("/boards/")) {
+            try {
+                await proxyBoardRequest(entry, req, res, url);
+            } catch (error) {
+                jsonResponse(
+                    res,
+                    error instanceof CanvasError ? 400 : 502,
+                    error instanceof CanvasError
+                        ? errorPayload(error)
+                        : {
+                            error: "azure_devops_board_unavailable",
+                            message: error?.message || "The Azure DevOps board is unavailable.",
+                        },
+                );
+            }
             return;
         }
         staticAsset(res, url.pathname);
@@ -4460,6 +5410,11 @@ export async function startServer(instanceId, input) {
     const port = typeof address === "object" && address ? address.port : 0;
     entry.server = server;
     entry.url = `http://127.0.0.1:${port}/`;
+    entry.closeBoards = async () => {
+        const boards = [...entry.boards.values()];
+        entry.boards.clear();
+        await Promise.allSettled(boards.map((board) => entry.closeBoard?.(board)));
+    };
     return entry;
 }
 
@@ -4491,6 +5446,8 @@ export {
     hasPullRequestReference,
     isSystemTimelineThread,
     linkPullRequestWorkItem,
+    listFavoriteBoards,
+    listMyPullRequests,
     listOrganizations,
     listProjects,
     listRepositories,
@@ -4509,9 +5466,11 @@ export {
     unlinkPullRequestWorkItem,
     updatePullRequest,
     updateWorkItemFields,
+    fetchAttachment,
     fetchAvatar,
     queryMyOpenWorkItems,
     requestNewSessionBranch,
     terminalWorkItemStateFilter,
+    validateAttachmentUrl,
     validateAvatarUrl,
 };

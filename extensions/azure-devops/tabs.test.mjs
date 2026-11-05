@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
-import { PULL_REQUEST_REVIEW_VOTING_ENABLED } from "./ui/feature-flags.mjs";
+import { PULL_REQUEST_REVIEW_VOTING_ENABLED } from "./common.mjs";
 import { workItemTypeColor } from "./ui/pull-request-actions.mjs";
 
 // These extensions ship without node_modules, so jsdom is not guaranteed to be
@@ -17,6 +17,7 @@ const describeDom = { skip: JSDOM ? false : "jsdom is not installed" };
 
 const html = readFileSync(new URL("./ui/index.html", import.meta.url), "utf8");
 const styles = readFileSync(new URL("./ui/styles.css", import.meta.url), "utf8");
+const allPreviewFeatures = { boards: true, delegation: true };
 
 // Drives the real app.mjs against a real DOM through the same controls a user
 // clicks. Nothing is exported from the app for testing.
@@ -79,6 +80,7 @@ function makeFetch(state) {
                     workItemReference: Boolean(state.workItemReference),
                     azureDevOpsMcpAvailable: Boolean(state.azureDevOpsMcpAvailable),
                     extensionVersion: "test",
+                    featureFlags: state.featureFlags || {},
                 },
             });
             return state.holdConfig ? state.holdConfig.then(() => response) : response;
@@ -139,16 +141,68 @@ function makeFetch(state) {
             const response = json({
                 connections: (state.homeConnections || [connection]).map((entry) => ({
                     ...entry,
-                    myPullRequests: { pullRequests: (entry.prs || state.homePrs || []).map((id) => ({ id, title: `PR ${id}`, status: "active", creationDate: new Date().toISOString() })) },
+                    myPullRequests: { pullRequests: (entry.prs || state.homePrs || []).map((id) => ({
+                        id,
+                        title: `PR ${id}`,
+                        status: "active",
+                        creationDate: new Date().toISOString(),
+                        commentCount: state.prCommentCounts?.[id]?.total || 0,
+                        openCommentCount: state.prCommentCounts?.[id]?.open || 0,
+                    })) },
+                    myBoards: {
+                        boards: (entry.boards || state.homeBoards || []).map((board, index) => ({
+                            id: board.id || `favorite-${index + 1}`,
+                            name: board.name || `Board ${index + 1}`,
+                            organization: entry.organization || connection.organization,
+                            project: entry.project || connection.project,
+                            team: board.team || "Project Team",
+                            backlogLevel: board.backlogLevel || "Stories",
+                            url: board.url || `https://dev.azure.com/example/project/_boards/board/t/Project%20Team/${encodeURIComponent(board.backlogLevel || "Stories")}`,
+                        })),
+                        otherProjectBoardCount: entry.otherProjectBoardCount || state.otherProjectBoardCount || 0,
+                    },
                     // An organization-scope list spans projects, so a row may carry
                     // one of its own; entries are either a bare id or [id, project].
                     myWorkItems: { workItems: (entry.workItems || state.homeWorkItems || []).map((entryId) => {
                         const [id, project] = Array.isArray(entryId) ? entryId : [entryId, ""];
-                        return { id, title: `WI ${id}`, type: "Task", state: "Active", project };
+                        return {
+                            id,
+                            title: `WI ${id}`,
+                            type: "Task",
+                            state: "Active",
+                            project,
+                            typeIcon: state.workItemTypeIcon || "",
+                        };
                     }) },
                 })),
             });
             return state.holdHome ? state.holdHome.then(() => response) : response;
+        }
+        if (path.includes("/api/feature-flags")) {
+            state.featureFlags = JSON.parse(options.body || "{}");
+            return json({ featureFlags: state.featureFlags });
+        }
+        if (path.includes("/api/boards/open")) {
+            const body = JSON.parse(options.body || "{}");
+            state.openedBoards = [...(state.openedBoards || []), body];
+            const board = (state.homeBoards || []).find((candidate) => candidate.id === body.id) || {
+                id: body.id,
+                name: "Board",
+            };
+            const token = `board-${state.openedBoards.length}`;
+            return json({
+                board: {
+                    ...board,
+                    organization: body.organization,
+                    project: body.project,
+                },
+                token,
+                path: `/boards/${token}/`,
+            });
+        }
+        if (/\/api\/boards\/[^/]+$/.test(path) && options.method === "DELETE") {
+            state.closedBoards = [...(state.closedBoards || []), path.split("/").pop()];
+            return json({ closed: true });
         }
         if (/\/api\/pull-requests\/\d+\/fix-comment(?:\?|$)/.test(path)) {
             state.fixRequests = [...(state.fixRequests || []), JSON.parse(options.body)];
@@ -171,6 +225,24 @@ function makeFetch(state) {
         if (path.includes("/api/identities")) {
             state.identityQueries = [...(state.identityQueries || []), path];
             return json({ identities: state.identities || [], error: state.identityError || "" });
+        }
+        const wiDelegation = path.match(/\/api\/work-items\/(\d+)\/delegate/);
+        if (wiDelegation) {
+            if (!state.featureFlags?.delegation) {
+                return {
+                    ok: false,
+                    json: async () => ({
+                        error: "azure_devops_delegation_disabled",
+                        message: "Work item delegation is disabled.",
+                    }),
+                };
+            }
+            state.workItemDelegations = [...(state.workItemDelegations || []), {
+                id: Number(wiDelegation[1]),
+                path,
+                body: JSON.parse(options.body || "{}"),
+            }];
+            return json(state.workItemDelegationResult || { ok: true, state: "Active" });
         }
         const prThreadAction = path.match(/\/api\/pull-requests\/(\d+)\/threads\/(\d+)(\/comments)?/);
         if (prThreadAction) {
@@ -214,7 +286,7 @@ function makeFetch(state) {
                 return {
                     ok: false,
                     json: async () => ({
-                        error: "azure_devops_request_failed",
+                        error: state.pullRequestErrorCode || "azure_devops_request_failed",
                         message: state.pullRequestError,
                     }),
                 };
@@ -266,6 +338,7 @@ function makeFetch(state) {
                     title: `WI ${wi[1]}`,
                     commentCount: 0,
                     discussion: [],
+                    templateSections: state.workItemSections || [],
                     relations: state.relations || [],
                 },
             });
@@ -305,16 +378,98 @@ async function boot(state = {}) {
 }
 
 const bar = (w) => w.document.getElementById("viewTabs");
+const allTabEls = (w) => [...bar(w).querySelectorAll(".view-tab")];
 const tabEls = (w) => [...bar(w).querySelectorAll(".view-tab")];
 const titles = (w) => tabEls(w).map((el) => el.querySelector(".view-tab-label").textContent);
+const allTitles = (w) => allTabEls(w).map((el) => el.querySelector(".view-tab-label").textContent);
 const activeTitle = (w) => bar(w).querySelector(".view-tab.active .view-tab-label")?.textContent;
-const visiblePanels = (w) => [...w.document.querySelectorAll("#homePanel, .tab-panel")].filter((p) => !p.hidden);
+const visiblePanels = (w) => [...w.document.querySelectorAll("#homePanel, #tabPanels > .tab-panel")].filter((p) => !p.hidden);
 const marks = (w) => tabEls(w).map((el) => Boolean(el.querySelector(".view-tab-branch")));
 
+test("attachment app registration: work-item images use the nonce proxy after sanitization", describeDom, async (t) => {
+    const source = "https://dev.azure.com/fabrikam/4e1c4e8f-0c57-4a25-9a4e-2e2c2f4d8a55/_apis/wit/attachments/06f5932c-aa2f-4545-9764-8546bec98914?fileName=image.png";
+    const other = "https://example.com/image.png";
+    const namedProject = source.replace("4e1c4e8f-0c57-4a25-9a4e-2e2c2f4d8a55", "Project");
+    const { window } = await boot({
+        homeWorkItems: [400],
+        workItemSections: [{
+            title: "Description",
+            fields: [{
+                name: "Description",
+                field: "System.Description",
+                isHtml: true,
+                value: `<img src="${source}" onerror="alert(1)"><img src="${other}"><img src="${namedProject}">`,
+            }],
+        }],
+    });
+    t.after(() => window.close());
+    await openFromHome(window, 400);
+    const images = [...window.document.querySelectorAll(".section-field-value img")];
+    assert.equal(images.length, 3);
+    assert.equal(images[0].getAttribute("src"), `/api/attachment?${new URLSearchParams({ organization: "example", project: "project", url: source, nonce: "n" })}`);
+    assert.equal(new URL(images[0].src).origin, window.location.origin);
+    assert.equal(images[0].hasAttribute("onerror"), false);
+    assert.equal(images[1].src, other);
+    assert.equal(images[2].src, namedProject);
+});
+
+test("attachment URLs retain each rendering tab's connection across organizations and previews", describeDom, async (t) => {
+    const source = "https://dev.azure.com/fabrikam/4e1c4e8f-0c57-4a25-9a4e-2e2c2f4d8a55/_apis/wit/attachments/06f5932c-aa2f-4545-9764-8546bec98914?fileName=image.png";
+    const { window } = await boot({
+        homeConnections: [
+            { organization: "contoso", project: "Widgets", workItems: [300], prs: [] },
+            { organization: "fabrikam", project: "Boxes", workItems: [400], prs: [202] },
+        ],
+        workItemSections: [{
+            title: "Description",
+            fields: [{
+                name: "Description",
+                field: "System.Description",
+                format: "markdown",
+                value: `![attachment](${source})`,
+            }],
+        }],
+        prDescription: `![attachment](${source})`,
+    });
+    t.after(() => window.close());
+    const assertConnection = (image, organization, project) => {
+        assert.ok(image);
+        const url = new URL(image.src);
+        assert.equal(url.pathname, "/api/attachment");
+        assert.equal(url.searchParams.get("organization"), organization);
+        assert.equal(url.searchParams.get("project"), project);
+        assert.equal(url.searchParams.get("nonce"), "n");
+        assert.equal(url.searchParams.get("url"), source);
+    };
+    await openFromHome(window, 400);
+    assertConnection(window.document.querySelector(".tab-panel:not([hidden]) .section-field-value img"), "fabrikam", "Boxes");
+    await openFromHome(window, 300);
+    assertConnection(window.document.querySelector(".tab-panel:not([hidden]) .section-field-value img"), "contoso", "Widgets");
+    await openFromHome(window, "!202");
+    assertConnection(window.document.querySelector(".tab-panel:not([hidden]) .pr-description-content img"), "fabrikam", "Boxes");
+    const edit = window.document.querySelector(".tab-panel:not([hidden]) .inline-edit");
+    assert.ok(edit);
+    edit.click();
+    await settle();
+    const preview = [...window.document.querySelectorAll(".tab-panel:not([hidden]) button")]
+        .find((button) => button.textContent === "Preview");
+    assert.ok(preview);
+    preview.click();
+    assertConnection(window.document.querySelector(".tab-panel:not([hidden]) .editor-preview img"), "fabrikam", "Boxes");
+});
+
 async function openFromHome(w, label) {
-    const link = [...w.document.querySelectorAll("#homeContent .home-row-link")]
+    const link = [...w.document.querySelectorAll("#homeContent .home-row-label")]
         .find((node) => node.querySelector(".home-row-id")?.textContent === String(label));
     assert.ok(link, `no Home row for ${label}`);
+    link.click();
+    await settle();
+}
+
+async function openBoardFromHome(w, name) {
+    const link = [...w.document.querySelectorAll("#homeContent .home-row-label")]
+        .find((node) => node.querySelector(".home-row-title")?.textContent === name);
+    assert.ok(link, `no Home board row for ${name}`);
     link.click();
     await settle();
 }
@@ -380,7 +535,7 @@ test("silent AzureAuth has a truthful animated startup state without flashing si
 });
 
 test("failed silent AzureAuth ends at the sign-in chooser", describeDom, async () => {
-    const { window } = await boot({
+    const { window, state } = await boot({
         configAuthProcess: {
             provider: "azureauth",
             mode: "silent",
@@ -429,8 +584,336 @@ test("failed silent AzureAuth ends at the sign-in chooser", describeDom, async (
 test("Home starts as the visible, stable first tab", describeDom, async () => {
     const { window } = await boot();
     assert.deepEqual(titles(window), ["Home"]);
+    assert.deepEqual(allTitles(window), ["Home"]);
     assert.equal(bar(window).hidden, false);
     assert.equal(visiblePanels(window).length, 1);
+});
+
+test("favorite boards open as independent closable tabs using their Home connection", describeDom, async () => {
+    const { window, state } = await boot({
+        featureFlags: allPreviewFeatures,
+        homeBoards: [
+            { id: "favorite-stories", name: "Stories board", team: "Web Team", backlogLevel: "Stories" },
+            { id: "favorite-features", name: "Features board", team: "Platform Team", backlogLevel: "Features" },
+        ],
+    });
+
+    assert.deepEqual(
+        [...window.document.querySelectorAll(".home-active-work .home-section-title")].map((node) => node.textContent),
+        ["Active pull requests", "My boards", "Open work items"],
+    );
+    const boardSection = [...window.document.querySelectorAll(".home-section")]
+        .find((section) => section.querySelector(".home-section-title")?.textContent === "My boards");
+    const firstBoardRow = boardSection?.querySelector(".home-row");
+    assert.equal(firstBoardRow?.querySelector(".home-row-id")?.textContent, "");
+    assert.ok(firstBoardRow?.querySelector(".home-row-icon svg path"));
+    assert.equal(firstBoardRow?.querySelector(".home-row-meta"), null);
+
+    await openBoardFromHome(window, "Stories board");
+    assert.deepEqual(titles(window), ["Home", "Stories board"]);
+    assert.equal(activeTitle(window), "Stories board");
+    assert.equal(window.document.querySelector(".board-frame")?.getAttribute("src"), "/boards/board-1/");
+    assert.deepEqual(state.openedBoards[0], {
+        id: "favorite-stories",
+        organization: "example",
+        project: "project",
+    });
+
+    await clickTab(window, 0);
+    await openBoardFromHome(window, "Features board");
+    assert.deepEqual(titles(window), ["Home", "Stories board", "Features board"]);
+    assert.equal(activeTitle(window), "Features board");
+    assert.equal(visiblePanels(window).length, 1);
+    const boardTabCloseIcon = tabEls(window)[1].querySelector(".view-tab-close svg");
+    assert.equal(boardTabCloseIcon?.getAttribute("data-icon-source"), "octicon");
+    assert.equal(boardTabCloseIcon?.getAttribute("data-icon-name"), "x");
+
+    await closeTab(window, 1);
+    assert.deepEqual(titles(window), ["Home", "Features board"]);
+    assert.deepEqual(state.closedBoards, ["board-1"]);
+});
+
+test("Home rows are clickable and use official icons with work-item-only delegation", describeDom, async () => {
+    const workItemTypeIcon = "data:image/svg+xml;base64,PHN2Zy8+";
+    const { window, state } = await boot({
+        featureFlags: allPreviewFeatures,
+        homePrs: [101, 102],
+        prCommentCounts: {
+            101: { open: 2, total: 5 },
+            102: { open: 0, total: 3 },
+        },
+        homeWorkItems: [[42, "Widgets"]],
+        workItemTypeIcon,
+    });
+
+    const pullRequestRows = [...window.document.querySelectorAll(".home-pr-row")];
+    assert.equal(pullRequestRows.length, 2);
+    assert.equal(
+        pullRequestRows[0].querySelector('[data-icon-name="git-pull-request"]')?.getAttribute("data-icon-source"),
+        "octicon",
+    );
+    assert.equal(pullRequestRows[0].querySelector(".home-pr-comments")?.textContent, "2/5");
+    assert.equal(pullRequestRows[0].querySelector(".home-pr-comments")?.getAttribute("aria-label"), "2 open of 5 comment threads");
+    assert.equal(
+        pullRequestRows[0].querySelector(".home-pr-comment-icon svg")?.getAttribute("data-icon-name"),
+        "comment-discussion",
+    );
+    assert.equal(pullRequestRows[1].querySelector(".home-pr-comments")?.textContent, "3");
+    assert.equal(
+        pullRequestRows[1].querySelector(".home-pr-comment-icon svg")?.getAttribute("data-icon-name"),
+        "comment",
+    );
+    assert.equal(pullRequestRows[0].querySelector(".home-row-delegate"), null);
+    assert.equal(pullRequestRows[0].querySelector(".home-row-side")?.lastElementChild?.className, "home-pr-comments has-open-comments");
+    assert.equal(pullRequestRows[0].getAttribute("role"), null);
+    assert.equal(pullRequestRows[0].querySelector(".home-row-hitbox")?.tagName, "BUTTON");
+    assert.equal(pullRequestRows[0].querySelector(".home-row-hitbox")?.getAttribute("aria-label"), "Open pull request !101: PR 101");
+    assert.match(styles, /\.home-row-label \{[^}]*color: var\(--text-color-default, #1f2328\)/);
+    assert.match(styles, /\.home-row-interactive:hover \{[^}]*background: var\(--background-color-control-transparent-hover/);
+    assert.match(styles, /\.home-row-hitbox \{[^}]*position: absolute;[^}]*inset: 0/);
+    assert.match(styles, /\.home-row-label\.has-leading-icon \+ \.home-row-meta \{[^}]*margin-inline-start: 24px/);
+    assert.match(styles, /\.home-row-side \{[^}]*justify-content: flex-end/);
+    assert.match(styles, /\.home-row-delegation \{[^}]*flex: 0 0 32px;[^}]*width: 32px/);
+    assert.match(styles, /\.primer-button\.home-row-delegate \{[^}]*width: 32px;[^}]*height: 24px;[^}]*padding: 0 8px/);
+
+    const workItemIcon = window.document.querySelector(".home-work-item-type-icon");
+    assert.equal(workItemIcon?.getAttribute("src"), workItemTypeIcon);
+    assert.equal(workItemIcon?.getAttribute("data-icon-source"), "azure-devops");
+    assert.equal(workItemIcon?.getAttribute("data-icon-name"), "Task");
+
+    const workItemRow = workItemIcon.closest(".home-row");
+    const delegateButton = workItemRow.querySelector(".home-row-delegate");
+    const delegateStatus = workItemRow.querySelector(".home-row-action-status");
+    assert.ok(delegateButton.classList.contains("primer-button"));
+    assert.ok(delegateButton.classList.contains("secondary"));
+    assert.equal(delegateButton.querySelector('[data-icon-name="device-desktop"]')?.getAttribute("data-icon-source"), "octicon");
+    assert.equal(delegateButton.querySelector('[data-icon-name="device-desktop"]')?.getAttribute("width"), "14");
+    assert.equal(delegateButton.textContent, "");
+    state.workItemDelegationResult = { ok: false, error: "Delegation unavailable" };
+    delegateButton.click();
+    await settle();
+    assert.equal(delegateStatus?.getAttribute("role"), "alert");
+    assert.equal(delegateStatus?.getAttribute("aria-live"), "assertive");
+    assert.deepEqual(titles(window), ["Home"], "delegating does not activate the row");
+
+    state.workItemDelegationResult = { ok: true, state: "Active" };
+    delegateButton.click();
+    await settle();
+    assert.equal(state.workItemDelegations.at(-1).id, 42);
+    assert.match(state.workItemDelegations.at(-1).path, /workItemProject=Widgets/);
+    assert.deepEqual(state.workItemDelegations.at(-1).body, { mode: "local", force: false });
+    assert.equal(delegateStatus?.getAttribute("role"), "status");
+    assert.equal(delegateStatus?.getAttribute("aria-live"), "polite");
+    assert.equal(delegateStatus?.textContent, "Delegation requested");
+    assert.equal(delegateButton.disabled, false, "a completed delegation can be retried");
+    assert.equal(delegateButton.classList.contains("is-complete"), true);
+
+    state.workItemDelegationResult = { ok: false, error: "Retry failed" };
+    delegateButton.click();
+    await settle();
+    assert.equal(delegateButton.classList.contains("is-complete"), false);
+    assert.equal(delegateButton.classList.contains("is-error"), true);
+    assert.equal(delegateStatus?.textContent, "Retry failed");
+
+    workItemRow.querySelector(".home-row-meta").click();
+    await settle();
+    assert.equal(activeTitle(window), "Task 42", "clicking outside the title opens the row");
+});
+
+test("Home hides work-item delegation when the preview feature is disabled", describeDom, async () => {
+    const { window } = await boot({ homeWorkItems: [42] });
+    assert.equal(window.document.querySelector(".home-work-item-row .home-row-delegate"), null);
+});
+
+test("board cards open the shared work item UI in a drawer with one Delegate menu", describeDom, async () => {
+    const { window, state } = await boot({
+        featureFlags: allPreviewFeatures,
+        homeBoards: [
+            { id: "favorite-stories", name: "Stories board", team: "Web Team", backlogLevel: "Stories" },
+        ],
+    });
+    await openBoardFromHome(window, "Stories board");
+    const frame = window.document.querySelector(".board-frame");
+    assert.ok(frame?.contentWindow);
+    const backgroundControl = window.document.getElementById("refreshButton");
+    backgroundControl.focus();
+
+    window.dispatchEvent(new window.MessageEvent("message", {
+        origin: window.location.origin,
+        source: frame.contentWindow,
+        data: {
+            source: "azure-devops-board",
+            type: "open-work-item",
+            id: 42,
+            project: "project",
+        },
+    }));
+    await settle();
+
+    const drawer = window.document.getElementById("workItemDrawer");
+    assert.equal(drawer.hidden, false);
+    assert.ok(drawer.classList.contains("open"));
+    assert.equal(window.document.activeElement, window.document.getElementById("workItemDrawerClose"));
+    assert.equal(window.document.getElementById("homePanel").getAttribute("aria-hidden"), "true");
+    assert.equal(window.document.getElementById("homePanel").hasAttribute("inert"), true);
+    assert.equal(backgroundControl.getAttribute("aria-hidden"), null);
+    assert.equal(backgroundControl.closest("footer").getAttribute("aria-hidden"), "true");
+    assert.equal(backgroundControl.closest("footer").hasAttribute("inert"), true);
+    const firstDrawerControl = window.document.getElementById("workItemDrawerExpand");
+    firstDrawerControl.focus();
+    firstDrawerControl.dispatchEvent(new window.KeyboardEvent("keydown", {
+        key: "Tab",
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true,
+    }));
+    assert.ok(drawer.contains(window.document.activeElement), "Shift+Tab remains inside the modal drawer");
+    assert.notEqual(window.document.activeElement, firstDrawerControl, "Shift+Tab wraps to the last control");
+    assert.equal(drawer.querySelector(".work-item-title")?.textContent, "WI 42");
+    assert.deepEqual(titles(window), ["Home", "Stories board"], "opening a card does not create a full-page tab");
+    assert.match(state.workItemRequests[0], /organization=example/);
+    assert.match(state.workItemRequests[0], /project=project/);
+
+    const delegate = drawer.querySelector(".work-item-delegate-menu");
+    assert.equal(delegate?.querySelector(".primer-action-menu-trigger-label")?.textContent, "Delegate");
+    const delegateTrigger = delegate.querySelector(".primer-action-menu-trigger");
+    assert.ok(delegateTrigger.classList.contains("primary"));
+    assert.equal(
+        delegate.parentElement,
+        drawer.querySelector(".work-item-header-actions"),
+        "Delegate stays in the far-right action area",
+    );
+    assert.equal(delegate.parentElement.childElementCount, 1);
+    assert.equal(drawer.querySelector(".work-item-header")?.lastElementChild, delegate.parentElement);
+    assert.ok(drawer.querySelector(".work-item-title-row > .inline-edit"));
+    assert.match(styles, /\.work-item-title-row\s*\{[^}]*justify-content: flex-start/);
+    assert.match(styles, /\.work-item-title-row\s*\{[^}]*align-items: flex-start/);
+    assert.match(styles, /\.detail-value\s*\{[^}]*overflow: hidden[^}]*text-overflow: ellipsis[^}]*white-space: nowrap/);
+    assert.match(styles, /\.state-pill-label\s*\{[^}]*overflow: hidden[^}]*text-overflow: ellipsis[^}]*white-space: nowrap/);
+    assert.equal(drawer.querySelector(".work-item-open-button"), null);
+    delegateTrigger.click();
+    assert.deepEqual(
+        [...delegate.querySelectorAll(".primer-action-list-label")].map((node) => node.textContent),
+        ["Delegate locally"],
+    );
+
+    const messages = [];
+    frame.contentWindow.postMessage = (message) => messages.push(message);
+    delegate.querySelector('[data-component="ActionList.Item"]').click();
+    assert.deepEqual(messages[0], {
+        source: "azure-devops-canvas",
+        type: "delegate-work-item",
+        requestId: "delegate-1",
+        mode: "local",
+        id: 42,
+    });
+
+    window.dispatchEvent(new window.MessageEvent("message", {
+        origin: window.location.origin,
+        source: frame.contentWindow,
+        data: {
+            source: "azure-devops-board",
+            type: "delegation-result",
+            requestId: "delegate-1",
+            result: { ok: true, state: "Active" },
+        },
+    }));
+    await settle();
+    assert.equal(
+        drawer.querySelector(".work-item-delegation-status")?.textContent,
+        "Delegated to a local Copilot session.",
+    );
+
+    assert.equal(
+        window.document.querySelector("#workItemDrawerExpand path")?.getAttribute("d"),
+        "M1.75 10a.75.75 0 0 1 .75.75v2.5c0 .138.112.25.25.25h2.5a.75.75 0 0 1 0 1.5h-2.5A1.75 1.75 0 0 1 1 13.25v-2.5a.75.75 0 0 1 .75-.75Zm12.5 0a.75.75 0 0 1 .75.75v2.5A1.75 1.75 0 0 1 13.25 15h-2.5a.75.75 0 0 1 0-1.5h2.5a.25.25 0 0 0 .25-.25v-2.5a.75.75 0 0 1 .75-.75ZM2.75 2.5a.25.25 0 0 0-.25.25v2.5a.75.75 0 0 1-1.5 0v-2.5C1 1.784 1.784 1 2.75 1h2.5a.75.75 0 0 1 0 1.5ZM10 1.75a.75.75 0 0 1 .75-.75h2.5c.966 0 1.75.784 1.75 1.75v2.5a.75.75 0 0 1-1.5 0v-2.5a.25.25 0 0 0-.25-.25h-2.5a.75.75 0 0 1-.75-.75Z",
+        "Expand uses Primer screen-full-16",
+    );
+    assert.equal(
+        window.document.querySelector("#workItemDrawerClose path")?.getAttribute("d"),
+        "M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.749.749 0 0 1 1.275.326.749.749 0 0 1-.215.734L9.06 8l3.22 3.22a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L8 9.06l-3.22 3.22a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z",
+        "Close uses Primer x-16",
+    );
+    assert.match(styles, /\.work-item-drawer-icon\s*\{[^}]*flex: 0 0 30px[^}]*width: 30px[^}]*height: 30px/);
+    window.document.getElementById("workItemDrawerExpand").click();
+    await settle();
+    assert.equal(drawer.classList.contains("open"), false);
+    assert.equal(window.document.getElementById("homePanel").hasAttribute("aria-hidden"), false);
+    assert.equal(window.document.getElementById("homePanel").hasAttribute("inert"), false);
+    assert.equal(backgroundControl.closest("footer").hasAttribute("aria-hidden"), false);
+    assert.equal(backgroundControl.closest("footer").hasAttribute("inert"), false);
+    assert.equal(window.document.activeElement, backgroundControl);
+    assert.deepEqual(titles(window), ["Home", "Stories board", "Task 42"]);
+
+    const workItemTab = visiblePanels(window)[0];
+    const tabDelegate = workItemTab.querySelector(".work-item-delegate-menu");
+    assert.equal(tabDelegate?.parentElement, workItemTab.querySelector(".work-item-header-actions"));
+    assert.equal(tabDelegate.parentElement.childElementCount, 1);
+    assert.equal(workItemTab.querySelector(".work-item-header")?.lastElementChild, tabDelegate.parentElement);
+    assert.ok(workItemTab.querySelector(".work-item-title-row > .inline-edit"));
+    tabDelegate.querySelector(".primer-action-menu-trigger").click();
+    assert.deepEqual(
+        [...tabDelegate.querySelectorAll(".primer-action-list-label")].map((node) => node.textContent),
+        ["Delegate locally"],
+    );
+});
+
+test("work items opened directly from Home expose local delegation", describeDom, async () => {
+    const { window, state } = await boot({
+        featureFlags: allPreviewFeatures,
+        homeWorkItems: [42],
+    });
+    await openFromHome(window, 42);
+
+    assert.deepEqual(titles(window), ["Home", "Task 42"]);
+    assert.equal(state.openedBoards, undefined, "delegation does not require opening a board");
+    const menu = visiblePanels(window)[0].querySelector(".work-item-delegate-menu");
+    assert.equal(menu?.querySelector(".primer-action-menu-trigger-label")?.textContent, "Delegate");
+    menu.querySelector(".primer-action-menu-trigger").click();
+    assert.deepEqual(
+        [...menu.querySelectorAll(".primer-action-list-label")].map((node) => node.textContent),
+        ["Delegate locally"],
+    );
+    menu.querySelector('[data-component="ActionList.Item"]').click();
+    await settle();
+
+    assert.deepEqual(state.workItemDelegations, [{
+        id: 42,
+        path: "/api/work-items/42/delegate?organization=example&project=project&workItemProject=project",
+        body: { mode: "local", force: false },
+    }]);
+    assert.equal(
+        visiblePanels(window)[0].querySelector(".work-item-delegation-status")?.textContent,
+        "Delegated to a local Copilot session.",
+    );
+});
+
+test("disabling delegation removes it from an open work item", describeDom, async () => {
+    const { window } = await boot({
+        featureFlags: allPreviewFeatures,
+        homeWorkItems: [42],
+    });
+    await openFromHome(window, 42);
+
+    assert.ok(visiblePanels(window)[0].querySelector(".work-item-delegate-menu"));
+    const delegationToggle = window.document.getElementById("delegationFeatureFlag");
+    delegationToggle.checked = false;
+    delegationToggle.dispatchEvent(new window.Event("change"));
+    await settle();
+
+    assert.equal(visiblePanels(window)[0].querySelector(".work-item-delegate-menu"), null);
+});
+
+test("My boards explains when favorites belong to other projects", describeDom, async () => {
+    const { window } = await boot({
+        featureFlags: { boards: true },
+        otherProjectBoardCount: 9,
+    });
+    const boards = [...window.document.querySelectorAll(".home-section")]
+        .find((section) => section.querySelector(".home-section-title")?.textContent === "My boards");
+
+    assert.match(boards?.textContent || "", /No favorite boards in project\. 9 favorite boards are in other projects\./);
+    assert.equal(boards?.querySelector("button")?.textContent, "Choose another project");
 });
 
 test("Home shows animated progress for exactly as long as its data is unresolved", describeDom, async () => {
@@ -450,6 +933,30 @@ test("Home shows animated progress for exactly as long as its data is unresolved
     assert.ok(window.document.querySelector(".home-active-work"));
 });
 
+test("Home loading omits boards after disabling the Boards preview", describeDom, async () => {
+    const initialHome = deferred();
+    const { window, state } = await boot({
+        featureFlags: { boards: true },
+        holdHome: initialHome.promise,
+    });
+
+    initialHome.resolve();
+    await settle();
+    const home = deferred();
+    const boardsToggle = window.document.getElementById("boardsFeatureFlag");
+    state.holdHome = home.promise;
+    boardsToggle.checked = false;
+    boardsToggle.dispatchEvent(new window.Event("change"));
+    await settle();
+
+    assert.equal(
+        window.document.querySelector(".home-loading-state .loading-detail")?.textContent,
+        "Fetching pull requests and work items.",
+    );
+    home.resolve();
+    await settle();
+});
+
 test("Home remains visible with a saved connection and no Azure DevOps remote", describeDom, async () => {
     const { window } = await boot({ isAzureDevOps: false });
     assert.deepEqual(titles(window), ["Home"]);
@@ -459,7 +966,11 @@ test("Home remains visible with a saved connection and no Azure DevOps remote", 
 });
 
 test("Home without a session branch shows assigned work and can ask chat to create one", describeDom, async () => {
-    const { window, state } = await boot({ homePrs: [101], homeWorkItems: [400] });
+    const { window, state } = await boot({
+        featureFlags: { boards: true },
+        homePrs: [101],
+        homeWorkItems: [400],
+    });
     assert.equal(window.document.querySelector(".home-title"), null);
     assert.deepEqual(
         [...window.document.querySelectorAll(".home-group-title")].map((node) => node.textContent),
@@ -467,7 +978,7 @@ test("Home without a session branch shows assigned work and can ask chat to crea
     );
     assert.deepEqual(
         [...window.document.querySelectorAll(".home-section-title")].map((node) => node.textContent),
-        ["Branch", "Pull request", "Related work items", "Development", "Active pull requests", "Open work items"],
+        ["Branch", "Pull request", "Related work items", "Development", "Active pull requests", "My boards", "Open work items"],
     );
     const button = window.document.querySelector(".home-new-branch");
     assert.equal(button?.textContent, "New branch for current session");
@@ -483,6 +994,7 @@ test("Home without a session branch shows assigned work and can ask chat to crea
 
 test("Home separates current session cards from active work", describeDom, async () => {
     const { window, state } = await boot({
+        featureFlags: { boards: true },
         branch: "feature",
         leadPr: { id: 101, title: "Branch PR" },
         relatedWorkItems: [400],
@@ -490,7 +1002,8 @@ test("Home separates current session cards from active work", describeDom, async
             id: 700,
             pipeline: "Canvas CI",
             name: "20260810.7",
-            status: "succeeded",
+            status: "completed",
+            result: "succeeded",
             changedDate: new Date().toISOString(),
             webUrl: "https://dev.azure.com/example/Project/_build/results?buildId=700",
         }],
@@ -504,9 +1017,20 @@ test("Home separates current session cards from active work", describeDom, async
     );
     assert.deepEqual(
         [...window.document.querySelectorAll(".home-section-title")].map((node) => node.textContent),
-        ["Branch", "Pull request", "Related work items", "Development", "Active pull requests", "Open work items"],
+        ["Branch", "Pull request", "Related work items", "Development", "Active pull requests", "My boards", "Open work items"],
     );
     assert.equal(window.document.querySelector(".home-branch-name")?.textContent, "feature");
+    const developmentRow = [...window.document.querySelectorAll(".home-section")]
+        .find((section) => section.querySelector(".home-section-title")?.textContent === "Development")
+        ?.querySelector(".home-row");
+    assert.equal(developmentRow?.querySelectorAll(":scope > .home-row-content").length, 1);
+    assert.equal(developmentRow?.querySelector(".home-row-hitbox")?.tagName, "A");
+    assert.equal(developmentRow?.querySelector(".home-row-meta")?.textContent.includes("20260810.7"), true);
+    assert.equal(developmentRow?.querySelector(".home-row-meta")?.textContent.includes("Succeeded"), true);
+    assert.equal(
+        developmentRow?.querySelector('[data-icon-name="Success"]')?.getAttribute("data-icon-source"),
+        "azure-devops-ui",
+    );
     assert.deepEqual(
         [...window.document.querySelectorAll(".home-row-id")].map((node) => node.textContent),
         ["!101", "400", "#700", "!102", "401"],
@@ -515,8 +1039,58 @@ test("Home separates current session cards from active work", describeDom, async
     assert.equal(state.homeRequests, 1);
 });
 
+test("Development maps every ADO build state to the official status vectors", describeDom, async () => {
+    const expected = [
+        { status: "completed", result: "succeeded", icon: "Success", tone: "success", label: "Succeeded" },
+        { status: "completed", result: "partiallySucceeded", icon: "Warning", tone: "warning", label: "Partially succeeded" },
+        { status: "completed", result: "failed", icon: "Failed", tone: "failed", label: "Failed" },
+        { status: "completed", result: "canceled", icon: "Canceled", tone: "neutral", label: "Canceled" },
+        { status: "inProgress", result: "none", icon: "Running", tone: "active", label: "In progress" },
+        { status: "notStarted", result: "none", icon: "Queued", tone: "neutral", label: "Not started" },
+        { status: "postponed", result: "", icon: "Waiting", tone: "active", label: "Postponed" },
+        { status: "cancelling", result: "", icon: "Canceled", tone: "neutral", label: "Cancelling" },
+        { status: "abandoned", result: "", icon: "Abandoned", tone: "neutral", label: "Abandoned" },
+        { status: "completed", result: "none", icon: "Information", tone: "neutral", label: "Completed" },
+        { status: "none", result: "none", icon: "Information", tone: "neutral", label: "None" },
+    ];
+    const { window } = await boot({
+        branch: "feature",
+        leadPr: { id: 101, title: "Branch PR" },
+        pipelineRuns: expected.map((run, index) => ({
+            ...run,
+            id: 700 + index,
+            pipeline: `Pipeline ${index + 1}`,
+            name: `Build ${index + 1}`,
+            webUrl: `https://dev.azure.com/example/Project/_build/results?buildId=${700 + index}`,
+        })),
+    });
+    const development = [...window.document.querySelectorAll(".home-section")]
+        .find((candidate) => candidate.querySelector(".home-section-title")?.textContent === "Development");
+    const rows = [...development.querySelectorAll(".home-row")];
+
+    assert.equal(rows.length, expected.length);
+    assert.deepEqual(rows.map((row) => {
+        const icon = row.querySelector('[data-icon-source="azure-devops-ui"]');
+        return {
+            icon: icon?.getAttribute("data-icon-name"),
+            tone: [...icon.classList]
+                .find((name) => /^is-(success|warning|failed|active|neutral)$/.test(name))
+                ?.replace(/^is-/, ""),
+            label: row.querySelector(".home-row-meta").textContent.split(" · ")[1],
+        };
+    }), expected.map(({ icon, tone, label }) => ({ icon, tone, label })));
+    for (const index of [1, 3, 5, 7, 8, 9, 10]) {
+        const path = rows[index].querySelector('[data-icon-source="azure-devops-ui"] path');
+        assert.equal(path?.getAttribute("fill-rule"), "evenodd");
+        assert.equal(path?.getAttribute("clip-rule"), "evenodd");
+    }
+    assert.ok(rows[4].querySelector(".home-pipeline-status-icon.is-animated .home-pipeline-status-running-arcs"));
+    assert.match(styles, /@keyframes home-pipeline-status-running/);
+});
+
 test("Home shows only the Branch card for the default branch", describeDom, async () => {
     const { window } = await boot({
+        featureFlags: { boards: true },
         branch: "main",
         defaultBranch: true,
         homePrs: [102],
@@ -530,7 +1104,7 @@ test("Home shows only the Branch card for the default branch", describeDom, asyn
     assert.deepEqual(
         [...window.document.querySelectorAll(".home-active-work .home-section-title")]
             .map((node) => node.textContent),
-        ["Active pull requests", "Open work items"],
+        ["Active pull requests", "My boards", "Open work items"],
     );
     assert.equal(window.document.querySelector(".home-branch-name")?.textContent, "main");
 });
@@ -600,6 +1174,46 @@ test("pull request load failures explain the problem and expose a retry", descri
     assert.equal(state?.querySelector(".pr-load-state-title")?.textContent, "Pull request could not load");
     assert.equal(state?.querySelector(".pr-load-state-message")?.textContent, "The project is temporarily unavailable.");
     assert.equal(state?.querySelector(".retry-button")?.textContent, "Retry");
+});
+
+test("a sign-in Azure DevOps rejects returns to the sign-in chooser", describeDom, async () => {
+    const { window } = await boot({
+        homePrs: [101],
+        pullRequestError: "Azure DevOps did not accept the sign-in. Sign in again.",
+        pullRequestErrorCode: "azure_devops_authentication_rejected",
+        authStatus: { auth: { isAuthenticated: false, authType: "none" } },
+    });
+    await openFromHome(window, "!101");
+
+    assert.equal(window.document.getElementById("signInSplash").hidden, false);
+    assert.equal(window.document.getElementById("canvasContent").hidden, true);
+});
+
+test("a stale rejection keeps a newer authenticated session visible", describeDom, async (t) => {
+    const { window, state } = await boot({
+        homePrs: [101],
+        pullRequestError: "Azure DevOps did not accept the sign-in. Sign in again.",
+        pullRequestErrorCode: "azure_devops_authentication_rejected",
+        authStatus: { auth: { isAuthenticated: true, authType: "microsoft" } },
+    });
+    t.after(() => window.close());
+    await openFromHome(window, "!101");
+    assert.equal(state.authStatusRequests, 1);
+    assert.equal(window.document.getElementById("signInSplash").hidden, true);
+    assert.equal(window.document.getElementById("canvasContent").hidden, false);
+});
+
+test("an older rejection does not replace an in-progress sign-in with the chooser", describeDom, async (t) => {
+    const { window } = await boot({
+        homePrs: [101],
+        pullRequestError: "Azure DevOps did not accept the sign-in. Sign in again.",
+        pullRequestErrorCode: "azure_devops_authentication_rejected",
+        authStatus: { auth: null, authProcess: { status: "running" } },
+    });
+    t.after(() => window.close());
+    await openFromHome(window, "!101");
+    assert.equal(window.document.getElementById("signInSplash").hidden, true);
+    assert.equal(window.document.getElementById("canvasContent").hidden, false);
 });
 
 test("pull request comments use a Primer ActionMenu filter", describeDom, async () => {
@@ -1273,6 +1887,125 @@ test("following a link inside a work item opens it in its own tab", describeDom,
     assert.match(state.workItemRequests.at(-1), /workItemProject=Other\+Project/);
 });
 
+test("following a pull request link inside a work item opens a canvas tab", describeDom, async () => {
+    const relations = [{
+        name: "Development",
+        links: [{
+            id: 0,
+            kind: "pull-request",
+            kindLabel: "Pull request",
+            projectId: "target-project",
+            repositoryId: "target-repo",
+            identifier: "101",
+            label: "Pull request 101",
+            title: "Related change",
+            webUrl: "https://dev.azure.com/example/project/_git/repo/pullrequest/101",
+        }],
+    }];
+    const { window, state } = await boot({
+        project: "",
+        homeWorkItems: [[400, "SourceProject"]],
+        relations,
+    });
+
+    await openFromHome(window, "400");
+    const pullRequest = window.document.querySelector(
+        ".tab-panel:not([hidden]) .development-section button.relation-link",
+    );
+    assert.equal(pullRequest?.textContent, "Pull request 101 Related change");
+    pullRequest.click();
+    await settle();
+
+    assert.deepEqual(titles(window), ["Home", "Task 400", "PR !101"]);
+    assert.equal(activeTitle(window), "PR !101");
+    assert.match(state.pullRequestRequests.at(-1), /\/api\/pull-requests\/101/);
+    assert.match(state.pullRequestRequests.at(-1), /pullRequestProject=target-project/);
+    assert.match(state.pullRequestRequests.at(-1), /pullRequestRepositoryId=target-repo/);
+});
+
+test("pull request project GUIDs and names resolve to the same canvas tab", describeDom, async () => {
+    const relations = [{
+        name: "Development",
+        links: [{
+            id: 0,
+            kind: "pull-request",
+            kindLabel: "Pull request",
+            projectId: "project-guid",
+            repositoryId: "repo-guid",
+            identifier: "101",
+            label: "Pull request 101",
+            webUrl: "https://dev.azure.com/example/project-guid/_git/repo-guid/pullrequest/101",
+        }],
+    }];
+    const { window, state } = await boot({
+        homePrs: [101],
+        homeWorkItems: [400],
+        relations,
+    });
+
+    await openFromHome(window, "!101");
+    await clickTab(window, 0);
+    await openFromHome(window, "400");
+    window.document.querySelector(
+        ".tab-panel:not([hidden]) .development-section button.relation-link",
+    ).click();
+    await settle();
+
+    assert.deepEqual(titles(window), ["Home", "PR !101", "Task 400"]);
+    assert.equal(activeTitle(window), "PR !101");
+    assert.equal(state.pullRequestRequests.length, 1, "the relation focuses the existing PR tab");
+});
+
+test("following a pull request link from a Board drawer opens a canvas tab", describeDom, async () => {
+    const relations = [{
+        name: "Development",
+        links: [{
+            id: 0,
+            kind: "pull-request",
+            kindLabel: "Pull request",
+            projectId: "target-project",
+            repositoryId: "target-repo",
+            identifier: "101",
+            label: "Pull request 101",
+            title: "Related change",
+            webUrl: "https://dev.azure.com/example/project/_git/repo/pullrequest/101",
+        }],
+    }];
+    const { window, state } = await boot({
+        featureFlags: allPreviewFeatures,
+        homeBoards: [{ id: "favorite-stories", name: "Stories board", team: "Web Team", backlogLevel: "Stories" }],
+        relations,
+    });
+    await openBoardFromHome(window, "Stories board");
+    const frame = window.document.querySelector(".board-frame");
+    window.dispatchEvent(new window.MessageEvent("message", {
+        origin: window.location.origin,
+        source: frame.contentWindow,
+        data: {
+            source: "azure-devops-board",
+            type: "open-work-item",
+            id: 400,
+            project: "project",
+            boardNonce: frame.dataset.boardNonce,
+        },
+    }));
+    await settle();
+
+    const pullRequest = window.document.querySelector(
+        ".work-item-drawer .development-section button.relation-link",
+    );
+    assert.equal(pullRequest?.textContent, "Pull request 101 Related change");
+    pullRequest.click();
+    await settle();
+
+    assert.deepEqual(titles(window), ["Home", "Stories board", "PR !101"]);
+    assert.equal(activeTitle(window), "PR !101");
+    assert.equal(window.document.querySelector(".work-item-drawer")?.classList.contains("open"), false);
+    assert.match(state.pullRequestRequests.at(-1), /\/api\/pull-requests\/101/);
+    assert.match(state.pullRequestRequests.at(-1), /pullRequestProject=target-project/);
+    assert.match(state.pullRequestRequests.at(-1), /pullRequestRepositoryId=target-repo/);
+});
+
 test("walking a chain of linked work items keeps every item open", describeDom, async () => {
     // Each item links onward, so following the chain is the case that previously
     // collapsed into a single tab.
@@ -1325,7 +2058,7 @@ test("a slow tab load does not scroll whichever tab the user switched to", descr
     await clickTab(window, 0);
 
     // Start !102, then return to !101 before !102 resolves.
-    const link = [...window.document.querySelectorAll("#homeContent .home-row-link")]
+    const link = [...window.document.querySelectorAll("#homeContent .home-row-label")]
         .find((n) => n.querySelector(".home-row-id")?.textContent === "!102");
     link.click();
     await settle();
@@ -1348,7 +2081,7 @@ test("closing a tab mid-load discards its result", describeDom, async () => {
 
     await openFromHome(window, "!101");
     await clickTab(window, 0);
-    const link = [...window.document.querySelectorAll("#homeContent .home-row-link")]
+    const link = [...window.document.querySelectorAll("#homeContent .home-row-label")]
         .find((n) => n.querySelector(".home-row-id")?.textContent === "!102");
     link.click();
     await settle();
@@ -1442,7 +2175,7 @@ test("switching to a slow tab and away again does not scroll the tab left behind
 
     await openFromHome(window, "!101");
     await clickTab(window, 0);
-    const link = [...window.document.querySelectorAll("#homeContent .home-row-link")]
+    const link = [...window.document.querySelectorAll("#homeContent .home-row-label")]
         .find((n) => n.querySelector(".home-row-id")?.textContent === "!102");
     link.click();
     await settle();
@@ -1606,7 +2339,7 @@ test("the same id in two organizations opens as two tabs, because they are two i
             { source: "default", organization: "fabrikam", project: "Boxes", isRemote: false, isDefault: true, requiresProject: false, prs: [500], workItems: [] },
         ],
     });
-    const links = [...window.document.querySelectorAll("#homeContent .home-row-link")]
+    const links = [...window.document.querySelectorAll("#homeContent .home-row-label")]
         .filter((node) => node.querySelector(".home-row-id")?.textContent === "!500");
     assert.equal(links.length, 2);
     links[0].click();
@@ -1649,6 +2382,51 @@ test("an organization-scope work item row carries its own project to the detail 
     assert.match(request, /organization=fabrikam/);
     assert.match(request, /workItemProject=Beta/, "the connection has no project, so the row supplies one");
     assert.deepEqual(titles(window), ["Home", "Task 4711"]);
+});
+
+test("same-numbered organization-scope work items in different projects open separate tabs", describeDom, async () => {
+    const state = {
+        remote: { isAzureDevOps: false },
+        connections: [{ source: "default", organization: "fabrikam", project: "", isDefault: true, isRemote: false, requiresProject: true }],
+        homeConnections: [
+            {
+                source: "default",
+                organization: "fabrikam",
+                project: "",
+                isRemote: false,
+                isDefault: true,
+                requiresProject: true,
+                prs: [],
+                workItems: [[4711, "Alpha"], [4711, "Beta"]],
+            },
+        ],
+    };
+    const { window } = await boot(state);
+    const links = [...window.document.querySelectorAll("#homeContent .home-row-label")]
+        .filter((node) => node.querySelector(".home-row-id")?.textContent === "4711");
+    assert.equal(links.length, 2);
+
+    links[0].click();
+    await settle();
+    await clickTab(window, 0);
+    links[1].click();
+    await settle();
+
+    assert.deepEqual(titles(window), ["Home", "Task 4711", "Task 4711"]);
+    assert.match(state.workItemRequests.at(-2), /workItemProject=Alpha/);
+    assert.match(state.workItemRequests.at(-1), /workItemProject=Beta/);
+});
+
+test("unrelated non-numeric work-item ids never collapse into one tab", describeDom, async () => {
+    const state = { homeWorkItems: ["not-a-number", "still-not-a-number"] };
+    const { window } = await boot(state);
+
+    await openFromHome(window, "not-a-number");
+    await clickTab(window, 0);
+    await openFromHome(window, "still-not-a-number");
+
+    assert.deepEqual(titles(window), ["Home", "Task 0", "Task 0"]);
+    assert.equal(state.workItemRequests.length, 2);
 });
 
 // Typing into a field commits on `input`, not on blur. Committing on blur would

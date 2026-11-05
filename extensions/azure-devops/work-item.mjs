@@ -549,6 +549,8 @@ function mapRelation(relation, relatedById, projectWebUrl) {
         changedDate: "",
         kind: artifact?.kind || (relation.rel === "Hyperlink" ? "link" : "artifact"),
         kindLabel: artifact?.kindLabel || normalizeString(relation.attributes?.name) || "Link",
+        projectId: artifact?.projectId || "",
+        repositoryId: artifact?.repositoryId || "",
         identifier: artifact?.identifier || "",
         webUrl: artifactWebUrl(artifact, projectWebUrl) || (/^https?:\/\//i.test(url) ? url : ""),
     };

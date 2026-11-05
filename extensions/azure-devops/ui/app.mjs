@@ -2,7 +2,7 @@ import { renderPullRequest } from "./pull-request-view.mjs";
 import { renderWorkItem } from "./work-item-view.mjs";
 import { renderHome } from "./home-view.mjs";
 import { renderConnectionPanel } from "./connection-view.mjs";
-import { AGENCY_AUTH_ENABLED } from "./feature-flags.mjs";
+import { AGENCY_AUTH_ENABLED, normalizeFeatureFlags } from "../common.mjs";
 
 const warning = document.getElementById("setupWarning");
 const startupSplash = document.getElementById("startupSplash");
@@ -18,6 +18,11 @@ const viewBar = document.querySelector(".view-bar");
 const authOutput = document.getElementById("authOutput");
 const logsPanel = document.getElementById("logsPanel");
 const connectionPanel = document.getElementById("connectionPanel");
+const workItemDrawerScrim = document.getElementById("workItemDrawerScrim");
+const workItemDrawer = document.getElementById("workItemDrawer");
+const workItemDrawerContent = document.getElementById("workItemDrawerContent");
+const workItemDrawerClose = document.getElementById("workItemDrawerClose");
+const workItemDrawerExpand = document.getElementById("workItemDrawerExpand");
 const connectionsButton = document.getElementById("connectionsButton");
 const refreshButton = document.getElementById("refreshButton");
 const signInMicrosoftButton = document.getElementById("signInMicrosoftButton");
@@ -27,6 +32,8 @@ const showLogsButton = document.getElementById("showLogsButton");
 const copyLogsButton = document.getElementById("copyLogsButton");
 const logsList = document.getElementById("logsList");
 const copyLogsStatus = document.getElementById("copyLogsStatus");
+const boardsFeatureFlag = document.getElementById("boardsFeatureFlag");
+const delegationFeatureFlag = document.getElementById("delegationFeatureFlag");
 const versionLabel = document.getElementById("versionLabel");
 
 let apiNonce = "";
@@ -35,6 +42,7 @@ let branchPullRequestInfo = null;
 let branchPullRequestId = 0;
 let homeLoaded = false;
 let logs = [];
+let enabledFeatures = normalizeFeatureFlags();
 
 // Tabs behave like browser tabs: every item opens in its own tab and is closed
 // independently. A tab is { id, entry, panel, content, data, rendered, token,
@@ -44,6 +52,19 @@ let logs = [];
 let tabs = [];
 let activeTabId = "";
 let tabSequence = 0;
+let boardWorkItemDrawerState = null;
+let boardDelegationSequence = 0;
+const pendingBoardDelegations = new Map();
+let workItemDrawerBackgroundState = null;
+
+const focusableSelector = [
+    "a[href]",
+    "button:not([disabled])",
+    "input:not([disabled])",
+    "select:not([disabled])",
+    "textarea:not([disabled])",
+    '[tabindex]:not([tabindex="-1"])',
+].join(",");
 
 
 function addLog(level, message, details = "") {
@@ -71,6 +92,21 @@ function element(tagName, className, text) {
     if (className) node.className = className;
     if (text !== undefined) node.textContent = String(text);
     return node;
+}
+
+function closeIcon() {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("data-icon-source", "octicon");
+    svg.setAttribute("data-icon-name", "x");
+    svg.setAttribute("viewBox", "0 0 16 16");
+    svg.setAttribute("width", "12");
+    svg.setAttribute("height", "12");
+    svg.setAttribute("fill", "currentColor");
+    svg.setAttribute("aria-hidden", "true");
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", "M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.749.749 0 0 1 1.275.326.749.749 0 0 1-.215.734L9.06 8l3.22 3.22a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L8 9.06l-3.22 3.22a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z");
+    svg.append(path);
+    return svg;
 }
 
 function loadingSpinner(compact = false) {
@@ -132,7 +168,20 @@ async function request(path, options = {}, includeNonce = true) {
     } catch {
         throw new Error("The canvas received an invalid response.");
     }
-    if (!response.ok) throw new Error(data.message || data.error || "Request failed.");
+    if (!response.ok) {
+        // A newer sign-in may have replaced the rejected token while this request
+        // was in flight. Only show the chooser if the server is still signed out.
+        if (data.error === "azure_devops_authentication_rejected") {
+            const status = await request("/api/auth/status");
+            if (currentConfig) {
+                currentConfig.auth = status.auth || currentConfig.auth;
+            }
+            if (status.auth?.isAuthenticated === false) {
+                showSignInSplash();
+            }
+        }
+        throw new Error(data.message || data.error || "Request failed.");
+    }
     return data;
 }
 
@@ -291,13 +340,30 @@ function tabEntry(tab) {
 // Ids are compared without coercing a missing or non-numeric id to 0, which is
 // the id the reference-opened tab uses: collapsing onto it would focus that tab
 // instead of opening the link that was clicked. The organization is part of the
-// identity because two organizations can each have a work item 4711, and they
-// are not the same work item.
+// identity because two organizations can each have an item 4711. Pull request
+// IDs are organization-wide, so project names and GUIDs must not split one PR
+// into duplicate tabs. Organization-scope work-item rows carry their project
+// separately because their connection itself has no project.
 function sameEntry(left, right) {
-    return Boolean(left) && Boolean(right) &&
-        left.view === right.view &&
-        Object.is(Number(left.id), Number(right.id)) &&
-        (left.organization || "").toLowerCase() === (right.organization || "").toLowerCase();
+    if (!left || !right || left.view !== right.view) {
+        return false;
+    }
+    const leftId = Number(left.id);
+    const rightId = Number(right.id);
+    const sameId = left.view === "board"
+        ? String(left.id || "") === String(right.id || "")
+        : Number.isFinite(leftId) && Number.isFinite(rightId) && leftId === rightId;
+    const sameOrganization = (left.organization || "").toLowerCase() ===
+        (right.organization || "").toLowerCase();
+    if (!sameId || !sameOrganization) {
+        return false;
+    }
+    if (left.view === "pull-request") {
+        return true;
+    }
+    const leftProject = left.view === "work-item" ? left.workItemProject || left.project : left.project;
+    const rightProject = right.view === "work-item" ? right.workItemProject || right.project : right.project;
+    return (leftProject || "").toLowerCase() === (rightProject || "").toLowerCase();
 }
 
 // Every data request names the connection it belongs to, and the server checks
@@ -306,6 +372,8 @@ function connectionQuery(entry, extra = {}) {
     const params = new URLSearchParams();
     if (entry?.organization) params.set("organization", entry.organization);
     if (entry?.project) params.set("project", entry.project);
+    if (entry?.pullRequestProject) params.set("pullRequestProject", entry.pullRequestProject);
+    if (entry?.pullRequestRepositoryId) params.set("pullRequestRepositoryId", entry.pullRequestRepositoryId);
     for (const [key, value] of Object.entries(extra)) {
         if (value) params.set(key, value);
     }
@@ -316,7 +384,7 @@ function connectionQuery(entry, extra = {}) {
 function entryForConnection(view, id, connection, extra = {}) {
     return {
         view,
-        id: Number(id),
+        id: view === "board" ? String(id || "") : Number(id),
         organization: connection?.organization || "",
         project: connection?.project || "",
         ...extra,
@@ -330,6 +398,9 @@ function tabTitle(tab) {
     }
     if (entry.view === "pull-request") {
         return `PR !${tab.data?.id || entry.id}`;
+    }
+    if (entry.view === "board") {
+        return tab.data?.name || entry.name || "Board";
     }
     return tab.data ? `${tab.data.type} ${tab.data.id}` : `Work item ${entry.id}`;
 }
@@ -371,9 +442,10 @@ function renderTabBar() {
         item.append(label);
 
         if (tab.closable) {
-            const close = element("button", "view-tab-close", "×");
+            const close = element("button", "view-tab-close");
             close.type = "button";
             close.setAttribute("aria-label", `Close ${tabTitle(tab)}`);
+            close.append(closeIcon());
             close.title = `Close ${tabTitle(tab)}`;
             close.addEventListener("click", (event) => {
                 event.stopPropagation();
@@ -401,6 +473,9 @@ function createTab(entry, { closable = true } = {}) {
         scrollTop: 0,
         editMode: false,
         dirty: false,
+        delegationPending: false,
+        delegationStatus: "",
+        delegationError: "",
         closable,
         panel: null,
         content: null,
@@ -416,7 +491,10 @@ function createTab(entry, { closable = true } = {}) {
         tab.panel.setAttribute("role", "tabpanel");
         tab.panel.setAttribute("aria-live", "polite");
         tab.panel.hidden = true;
-        tab.content = element("div", "cards");
+        tab.content = element("div", entry.view === "board" ? "board-tab-content" : "cards");
+        if (entry.view === "board") {
+            tab.panel.classList.add("board-panel");
+        }
         tab.panel.append(tab.content);
         tabPanels.append(tab.panel);
     }
@@ -432,6 +510,9 @@ function showActivePanel() {
 
 async function activateTab(id) {
     if (id === activeTabId) {
+        return;
+    }
+    if (boardWorkItemDrawerState?.tab?.id === activeTabId && !closeBoardWorkItemDrawer()) {
         return;
     }
     const outgoing = activeTab();
@@ -462,6 +543,7 @@ function closeTab(id) {
         return;
     }
     const [closed] = tabs.splice(index, 1);
+    releaseBoardTab(closed);
     // Invalidates any load still in flight for this tab, so it cannot render into
     // a detached panel or report success for something the user closed.
     closed.token += 1;
@@ -492,6 +574,12 @@ function closeTab(id) {
 async function openEntry(entry) {
     const existing = tabs.find((tab) => sameEntry(tabEntry(tab), entry));
     if (existing) {
+        if (entry.boardTabId && tabEntry(existing)?.boardTabId !== entry.boardTabId) {
+            existing.entry = { ...tabEntry(existing), boardTabId: entry.boardTabId };
+            if (existing.data && !existing.dirty) {
+                renderWorkItemTab(existing);
+            }
+        }
         await activateTab(existing.id);
         return;
     }
@@ -527,17 +615,157 @@ async function applyTab(tab) {
     const token = tab.token;
     if (entry.view === "pull-request") {
         await loadPullRequestIntoTab(tab, entry.id, token);
+    } else if (entry.view === "board") {
+        await loadBoardIntoTab(tab, token);
     } else {
         await loadWorkItemIntoTab(tab, entry, token);
     }
     renderTabBar();
 }
 
+function releaseBoardToken(token) {
+    if (!token) {
+        return;
+    }
+    request(`/api/boards/${encodeURIComponent(token)}`, { method: "DELETE" })
+        .catch((error) => addLog("error", "Failed to close board server.", error.message || ""));
+}
+
+function releaseBoardTab(tab) {
+    if (tabEntry(tab)?.view === "board") {
+        if (boardWorkItemDrawerState?.tab === tab) {
+            closeBoardWorkItemDrawer(true);
+        }
+        for (const [requestId, pending] of pendingBoardDelegations) {
+            if (pending.tab === tab) {
+                clearTimeout(pending.timeout);
+                pending.reject(new Error("The board was closed before delegation completed."));
+                pendingBoardDelegations.delete(requestId);
+            }
+        }
+        for (const workItemTab of tabs) {
+            if (tabEntry(workItemTab)?.boardTabId !== tab.id) continue;
+            workItemTab.entry = { ...tabEntry(workItemTab), boardTabId: "" };
+            workItemTab.delegationPending = false;
+            workItemTab.delegationStatus = "";
+            workItemTab.delegationError = "";
+            if (workItemTab.data && !workItemTab.dirty) {
+                renderWorkItemTab(workItemTab);
+            }
+        }
+        releaseBoardToken(tab.data?.token);
+    }
+}
+
+async function loadBoardIntoTab(tab, token) {
+    const entry = tabEntry(tab);
+    showLoading(tab.content, `Opening ${entry.name || "board"}`, "Loading the favorited Azure DevOps board.");
+    tab.rendered = null;
+    try {
+        const data = await request("/api/boards/open", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                id: entry.id,
+                organization: entry.organization,
+                project: entry.project,
+            }),
+        });
+        if (token !== tab.token) {
+            releaseBoardToken(data.token);
+            return;
+        }
+        tab.data = { ...data.board, token: data.token, path: data.path };
+        tab.rendered = { ...entry };
+        const frame = element("iframe", "board-frame");
+        frame.title = `${data.board?.name || entry.name || "Azure DevOps"} board`;
+        frame.src = data.path;
+        tab.frame = frame;
+        tab.content.replaceChildren(frame);
+        addLog(
+            "trace",
+            "Opened favorite board.",
+            [data.board?.organization, data.board?.project, data.board?.name].filter(Boolean).join("/"),
+        );
+    } catch (error) {
+        if (token !== tab.token) {
+            return;
+        }
+        tab.data = null;
+        showStatus(tab.content, error.message || "Failed to open the Azure DevOps board.", () => applyTab(tab));
+        addLog("error", "Failed to open favorite board.", error.message || "");
+    }
+}
+
+function boardTabForMessage(event) {
+    if (event.origin !== window.location.origin) {
+        return null;
+    }
+    return tabs.find((tab) => (
+        tabEntry(tab)?.view === "board" &&
+        tab.frame?.contentWindow === event.source
+    )) || null;
+}
+
+window.addEventListener("message", (event) => {
+    if (event.data?.source !== "azure-devops-board") {
+        return;
+    }
+    const tab = boardTabForMessage(event);
+    if (!tab) {
+        return;
+    }
+    if (event.data.type === "open-work-item") {
+        void openBoardWorkItemDrawer(tab, {
+            id: event.data.id,
+            project: event.data.project || tabEntry(tab)?.project || "",
+        });
+        return;
+    }
+    if (event.data.type === "delegation-result") {
+        const pending = pendingBoardDelegations.get(event.data.requestId);
+        if (!pending || pending.tab !== tab || pending.source !== event.source) {
+            return;
+        }
+        clearTimeout(pending.timeout);
+        pendingBoardDelegations.delete(event.data.requestId);
+        pending.resolve(event.data.result || { ok: false, error: "Delegation failed." });
+    }
+});
+
+workItemDrawerExpand.addEventListener("click", () => {
+    const state = boardWorkItemDrawerState;
+    if (!state || !closeBoardWorkItemDrawer()) {
+        return;
+    }
+    void openWorkItem({
+        id: state.id,
+        project: state.workItemProject || tabEntry(state.tab)?.project || "",
+        boardTabId: state.tab.id,
+    }, tabEntry(state.tab));
+});
+workItemDrawerClose.addEventListener("click", () => closeBoardWorkItemDrawer());
+workItemDrawerScrim.addEventListener("click", () => closeBoardWorkItemDrawer());
+window.addEventListener("keydown", (event) => {
+    if (!boardWorkItemDrawerState) return;
+    if (event.key === "Tab") {
+        trapWorkItemDrawerFocus(event);
+    } else if (event.key === "Escape") {
+        event.preventDefault();
+        closeBoardWorkItemDrawer();
+    }
+});
+
 async function loadConfig() {
     const data = await request("/api/config", {}, false);
     apiNonce = data.apiNonce || "";
     if (!apiNonce) throw new Error("The canvas did not provide an API nonce.");
     currentConfig = data.config;
+    enabledFeatures = normalizeFeatureFlags(currentConfig.featureFlags);
+    if (boardsFeatureFlag && delegationFeatureFlag) {
+        boardsFeatureFlag.checked = enabledFeatures.boards;
+        delegationFeatureFlag.checked = enabledFeatures.delegation;
+    }
     versionLabel.textContent = currentConfig.extensionVersion ? `v${currentConfig.extensionVersion}` : "";
     // A note rather than a warning: with a connection the canvas works fine
     // without an Azure DevOps remote, and it stays silent when there is nothing
@@ -698,7 +926,9 @@ function canEditPullRequest(pr) {
 function renderWorkItemTab(tab) {
     renderWorkItem(tab.content, tab.data, {
         avatarUrl: profileImageUrl,
+        imageUrl: (url) => attachmentImageUrl(url, tabEntry(tab)),
         onOpenWorkItem: (item) => openWorkItem(item, tabEntry(tab)),
+        onOpenPullRequest: (relation) => openPullRequestRelation(relation, tabEntry(tab)),
         canEdit: true,
         editMode: tab.editMode,
         onDirtyChange: (dirty) => {
@@ -718,7 +948,402 @@ function renderWorkItemTab(tab) {
         onSearchIdentities: (query) => request(
             `/api/identities${connectionQuery(tabEntry(tab), { query })}`,
         ),
+        onDelegateLocal: enabledFeatures.delegation ? () => delegateWorkItemTab(tab, "local") : null,
+        delegationPending: tab.delegationPending,
+        delegationStatus: tab.delegationStatus,
+        delegationError: tab.delegationError,
     });
+}
+
+function sourceBoardTab(tab) {
+    const boardTabId = tabEntry(tab)?.boardTabId;
+    if (!boardTabId) return null;
+    return tabs.find((candidate) => candidate.id === boardTabId && tabEntry(candidate)?.view === "board") || null;
+}
+
+function renderBoardWorkItemDrawer() {
+    const state = boardWorkItemDrawerState;
+    if (!state?.data) {
+        return;
+    }
+    const scrollTop = workItemDrawerContent.scrollTop;
+    renderWorkItem(workItemDrawerContent, state.data, {
+        avatarUrl: profileImageUrl,
+        imageUrl: (url) => attachmentImageUrl(url, tabEntry(state.tab)),
+        canEdit: true,
+        editMode: state.editMode,
+        onOpenWorkItem: (item) => openBoardWorkItemDrawer(state.tab, item),
+        onOpenPullRequest: (relation) => {
+            if (closeBoardWorkItemDrawer()) {
+                void openPullRequestRelation(relation, tabEntry(state.tab));
+            }
+        },
+        onDirtyChange: (dirty) => {
+            if (boardWorkItemDrawerState !== state) return;
+            state.dirty = dirty;
+            state.tab.dirty = dirty;
+        },
+        onEdit: () => {
+            if (boardWorkItemDrawerState !== state) return;
+            state.editMode = true;
+            state.dirty = false;
+            state.tab.dirty = false;
+            renderBoardWorkItemDrawer();
+        },
+        onCancelEdit: () => {
+            if (boardWorkItemDrawerState !== state || (state.dirty && !confirmDiscard([state]))) return;
+            state.editMode = false;
+            state.dirty = false;
+            state.tab.dirty = false;
+            renderBoardWorkItemDrawer();
+        },
+        onSubmit: () => workItemDrawerContent.querySelector(".editor-save")?.click(),
+        onSave: (fields) => saveBoardWorkItemDrawer(fields),
+        onAddComment: (content) => postBoardWorkItemComment(content),
+        commentDraft: state.commentDraft,
+        onCommentDraftChange: (draft) => {
+            if (boardWorkItemDrawerState === state) {
+                state.commentDraft = draft.content ? draft : null;
+            }
+        },
+        onSearchIdentities: (query) => request(
+            `/api/identities${connectionQuery(tabEntry(state.tab), { query })}`,
+        ),
+        onDelegateLocal: enabledFeatures.delegation ? () => delegateBoardWorkItem("local") : null,
+        delegationPending: state.delegationPending,
+        delegationStatus: state.delegationStatus,
+        delegationError: state.delegationError,
+    });
+    workItemDrawerContent.scrollTop = scrollTop;
+}
+
+async function loadBoardWorkItemDrawer(state) {
+    const entry = tabEntry(state.tab);
+    showWorkItemLoading(workItemDrawerContent, state.id);
+    try {
+        const data = await request(
+            `/api/work-items/${encodeURIComponent(state.id)}/details${connectionQuery(entry, {
+                workItemProject: state.workItemProject || entry?.project,
+            })}`,
+        );
+        if (boardWorkItemDrawerState !== state) {
+            return;
+        }
+        state.data = data.workItem;
+        state.workItemProject = data.workItem?.project || state.workItemProject;
+        renderBoardWorkItemDrawer();
+        addLog("trace", "Loaded board work item details.", `${data.workItem.type} ${data.workItem.id}: ${data.workItem.title}`);
+    } catch (error) {
+        if (boardWorkItemDrawerState !== state) {
+            return;
+        }
+        addLog("error", "Failed to load board work item details.", error.message || "");
+        showStatus(
+            workItemDrawerContent,
+            error.message || "Unable to load the work item.",
+            () => loadBoardWorkItemDrawer(state),
+        );
+    }
+}
+
+function workItemDrawerBackgroundElements() {
+    return [
+        startupSplash,
+        signInSplash,
+        ...[...canvasContent.children].filter((element) => (
+            element !== workItemDrawerScrim && element !== workItemDrawer
+        )),
+        document.querySelector("footer"),
+        logsPanel,
+    ].filter(Boolean);
+}
+
+function setWorkItemDrawerBackgroundHidden(hidden) {
+    if (hidden) {
+        if (workItemDrawerBackgroundState) return;
+        workItemDrawerBackgroundState = new Map();
+        for (const element of workItemDrawerBackgroundElements()) {
+            workItemDrawerBackgroundState.set(element, {
+                inert: element.hasAttribute("inert"),
+                ariaHidden: element.getAttribute("aria-hidden"),
+            });
+            element.setAttribute("inert", "");
+            element.setAttribute("aria-hidden", "true");
+        }
+        return;
+    }
+    if (!workItemDrawerBackgroundState) return;
+    for (const [element, state] of workItemDrawerBackgroundState) {
+        if (!state.inert) element.removeAttribute("inert");
+        if (state.ariaHidden === null) element.removeAttribute("aria-hidden");
+        else element.setAttribute("aria-hidden", state.ariaHidden);
+    }
+    workItemDrawerBackgroundState = null;
+}
+
+function trapWorkItemDrawerFocus(event) {
+    if (event.key !== "Tab" || !boardWorkItemDrawerState) return;
+    const focusable = [...workItemDrawer.querySelectorAll(focusableSelector)]
+        .filter((element) => !element.closest("[hidden]"));
+    if (!focusable.length) {
+        event.preventDefault();
+        workItemDrawer.focus();
+        return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const active = document.activeElement;
+    const target = !workItemDrawer.contains(active)
+        ? (event.shiftKey ? last : first)
+        : event.shiftKey && active === first
+            ? last
+            : !event.shiftKey && active === last
+                ? first
+                : null;
+    if (target) {
+        event.preventDefault();
+        target.focus();
+    }
+}
+
+async function openBoardWorkItemDrawer(tab, workItem) {
+    const item = typeof workItem === "object" && workItem ? workItem : { id: workItem };
+    const id = Number(item.id);
+    if (!Number.isInteger(id) || id <= 0 || tabEntry(tab)?.view !== "board") {
+        return;
+    }
+    const previous = boardWorkItemDrawerState;
+    if (previous?.dirty && (previous.id !== id || previous.tab !== tab) && !confirmDiscard([previous])) {
+        return;
+    }
+    if (previous?.tab && previous.tab !== tab) {
+        previous.tab.dirty = false;
+    }
+    const state = {
+        tab,
+        id,
+        workItemProject: item.project || tabEntry(tab)?.project || "",
+        data: null,
+        editMode: false,
+        dirty: false,
+        commentDraft: null,
+        delegationPending: false,
+        delegationStatus: "",
+        delegationError: "",
+        returnFocus: previous?.returnFocus || document.activeElement,
+    };
+    boardWorkItemDrawerState = state;
+    setWorkItemDrawerBackgroundHidden(true);
+    workItemDrawerScrim.hidden = false;
+    workItemDrawer.hidden = false;
+    window.requestAnimationFrame(() => {
+        if (boardWorkItemDrawerState !== state) return;
+        workItemDrawerScrim.classList.add("open");
+        workItemDrawer.classList.add("open");
+        workItemDrawerClose.focus();
+    });
+    await loadBoardWorkItemDrawer(state);
+}
+
+function closeBoardWorkItemDrawer(force = false) {
+    const state = boardWorkItemDrawerState;
+    if (!state) {
+        return true;
+    }
+    if (!force && state.dirty && !confirmDiscard([state])) {
+        return false;
+    }
+    state.tab.dirty = false;
+    boardWorkItemDrawerState = null;
+    workItemDrawerScrim.classList.remove("open");
+    workItemDrawer.classList.remove("open");
+    setWorkItemDrawerBackgroundHidden(false);
+    setTimeout(() => {
+        if (boardWorkItemDrawerState) return;
+        workItemDrawerScrim.hidden = true;
+        workItemDrawer.hidden = true;
+        workItemDrawerContent.replaceChildren();
+    }, 180);
+    state.returnFocus?.focus?.();
+    return true;
+}
+
+async function saveBoardWorkItemDrawer(fields) {
+    const state = boardWorkItemDrawerState;
+    if (!state?.data) return;
+    if (!fields.length) {
+        state.editMode = false;
+        state.dirty = false;
+        state.tab.dirty = false;
+        renderBoardWorkItemDrawer();
+        return;
+    }
+    const entry = tabEntry(state.tab);
+    const data = await request(
+        `/api/work-items/${encodeURIComponent(state.id)}${connectionQuery(entry, {
+            workItemProject: state.workItemProject || entry?.project,
+        })}`,
+        {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ rev: state.data.rev, fields }),
+        },
+    );
+    if (boardWorkItemDrawerState !== state) return;
+    state.data = data.workItem;
+    state.editMode = false;
+    state.dirty = false;
+    state.tab.dirty = false;
+    renderBoardWorkItemDrawer();
+    addLog("trace", "Saved board work item changes.", `Work item #${state.id}`);
+}
+
+async function postBoardWorkItemComment(content) {
+    const state = boardWorkItemDrawerState;
+    if (!state?.data) return;
+    const entry = tabEntry(state.tab);
+    const data = await request(
+        `/api/work-items/${encodeURIComponent(state.id)}/comments${connectionQuery(entry, {
+            workItemProject: state.workItemProject || entry?.project,
+        })}`,
+        {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ content }),
+        },
+    );
+    if (boardWorkItemDrawerState !== state) return;
+    state.data = data.workItem;
+    state.commentDraft = null;
+    renderBoardWorkItemDrawer();
+    addLog("trace", "Added a board work item comment.", `Work item #${state.id}`);
+}
+
+function sendBoardDelegation(boardTab, id, mode) {
+    const frameWindow = boardTab.frame?.contentWindow;
+    if (!frameWindow) {
+        return Promise.reject(new Error("The board is not ready."));
+    }
+    boardDelegationSequence += 1;
+    const requestId = `delegate-${boardDelegationSequence}`;
+    return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+            pendingBoardDelegations.delete(requestId);
+            reject(new Error("Delegation did not finish in time."));
+        }, 120_000);
+        timeout.unref?.();
+        pendingBoardDelegations.set(requestId, {
+            tab: boardTab,
+            source: frameWindow,
+            resolve,
+            reject,
+            timeout,
+        });
+        frameWindow.postMessage({
+            source: "azure-devops-canvas",
+            type: "delegate-work-item",
+            requestId,
+            mode,
+            id,
+        }, window.location.origin);
+    });
+}
+
+async function delegateBoardWorkItem(mode) {
+    const state = boardWorkItemDrawerState;
+    if (!state || state.delegationPending) return;
+    state.delegationPending = true;
+    state.delegationStatus = mode === "local" ? "Starting local delegation…" : "Starting cloud delegation…";
+    state.delegationError = "";
+    renderBoardWorkItemDrawer();
+    try {
+        const result = await sendBoardDelegation(state.tab, state.id, mode);
+        if (boardWorkItemDrawerState !== state) return;
+        state.delegationPending = false;
+        if (result?.cancelled) {
+            state.delegationStatus = "";
+        } else if (!result?.ok) {
+            state.delegationStatus = "";
+            state.delegationError = result?.error || "Delegation failed.";
+        } else {
+            state.delegationStatus = mode === "local"
+                ? "Delegated to a local Copilot session."
+                : "Delegated to a Copilot cloud agent.";
+            if (result.state && state.data) state.data.state = result.state;
+        }
+        if (["cloud_repo_missing", "repo_unreachable"].includes(result?.code)) {
+            closeBoardWorkItemDrawer(true);
+            return;
+        }
+        renderBoardWorkItemDrawer();
+    } catch (error) {
+        if (boardWorkItemDrawerState !== state) return;
+        state.delegationPending = false;
+        state.delegationStatus = "";
+        state.delegationError = error.message || "Delegation failed.";
+        renderBoardWorkItemDrawer();
+    }
+}
+
+async function delegateWorkItemTab(tab, mode) {
+    const boardTab = sourceBoardTab(tab);
+    if (tab.delegationPending) return;
+    tab.delegationPending = true;
+    tab.delegationStatus = mode === "local" ? "Starting local delegation…" : "Starting cloud delegation…";
+    tab.delegationError = "";
+    renderWorkItemTab(tab);
+    try {
+        let result = boardTab
+            ? await sendBoardDelegation(boardTab, tab.data.id, mode)
+            : await sendWorkItemDelegation(tab, mode);
+        if (!boardTab && ["in_flight", "already_linked"].includes(result?.code) && window.confirm(
+            `#${tab.data.id} already has work in flight.\n\nStart another session anyway? Two agents editing the same code at once can overwrite each other's work.`,
+        )) {
+            result = await sendWorkItemDelegation(tab, mode, true);
+        }
+        if (!tabs.includes(tab) || (boardTab && sourceBoardTab(tab) !== boardTab)) return;
+        tab.delegationPending = false;
+        if (result?.cancelled) {
+            tab.delegationStatus = "";
+        } else if (!result?.ok) {
+            tab.delegationStatus = "";
+            tab.delegationError = result?.error || "Delegation failed.";
+        } else {
+            tab.delegationStatus = mode === "local"
+                ? "Delegated to a local Copilot session."
+                : "Delegated to a Copilot cloud agent.";
+            if (result.state && tab.data) tab.data.state = result.state;
+        }
+        if (["cloud_repo_missing", "repo_unreachable"].includes(result?.code)) {
+            if (boardTab) {
+                await activateTab(boardTab.id);
+            } else {
+                renderWorkItemTab(tab);
+            }
+            return;
+        }
+        renderWorkItemTab(tab);
+    } catch (error) {
+        if (!tabs.includes(tab) || (boardTab && sourceBoardTab(tab) !== boardTab)) return;
+        tab.delegationPending = false;
+        tab.delegationStatus = "";
+        tab.delegationError = error.message || "Delegation failed.";
+        renderWorkItemTab(tab);
+    }
+}
+
+function sendWorkItemDelegation(tab, mode, force = false) {
+    const entry = tabEntry(tab);
+    return request(
+        `/api/work-items/${encodeURIComponent(tab.data.id)}/delegate${connectionQuery(entry, {
+            workItemProject: tab.data.project || entry?.workItemProject || entry?.project,
+        })}`,
+        {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ mode, force }),
+        },
+    );
 }
 
 async function postWorkItemComment(tab, content) {
@@ -826,7 +1451,10 @@ function openWorkItem(workItem, entry) {
         "work-item",
         item.id,
         entry,
-        { workItemProject: item.project || "" },
+        {
+            workItemProject: item.project || "",
+            boardTabId: item.boardTabId || entry?.boardTabId || "",
+        },
     ));
 }
 
@@ -837,10 +1465,19 @@ function profileImageUrl(imageUrl) {
     return `/api/avatar?${new URLSearchParams({ url: imageUrl, nonce: apiNonce })}`;
 }
 
+const ATTACHMENT_IMAGE_SOURCE =
+    /^https:\/\/[^/]+\/(?:[^/]+\/)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/_apis\/wit\/attachments\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:[?#]|$)/i;
+
+function attachmentImageUrl(imageUrl, entry) {
+    if (!apiNonce || !ATTACHMENT_IMAGE_SOURCE.test(imageUrl)) return imageUrl;
+    return `/api/attachment${connectionQuery(entry, { url: imageUrl, nonce: apiNonce })}`;
+}
+
 function renderPullRequestTab(tab) {
     tab.replyDrafts ||= {};
     renderPullRequest(tab.content, tab.data, {
         avatarUrl: profileImageUrl,
+        imageUrl: (url) => attachmentImageUrl(url, tabEntry(tab)),
         timelineFilter: tab.timelineFilter,
         canEdit: canEditPullRequest(tab.data),
         editMode: tab.editMode,
@@ -1063,12 +1700,45 @@ async function requestNewSessionBranch() {
     return data;
 }
 
+async function delegateHomeWorkItem(item, connection = null, force = false) {
+    const entry = entryForConnection(
+        "work-item",
+        item.id,
+        connection || defaultEntryConnection(),
+        { workItemProject: item.project || "" },
+    );
+    let result = await request(
+        `/api/work-items/${encodeURIComponent(item.id)}/delegate${connectionQuery(entry, {
+            workItemProject: item.project || entry.project,
+        })}`,
+        {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ mode: "local", force }),
+        },
+    );
+    if (!force && ["in_flight", "already_linked"].includes(result?.code)) {
+        if (!window.confirm(
+            `#${item.id} already has work in flight.\n\nStart another session anyway? Two agents editing the same code at once can overwrite each other's work.`,
+        )) {
+            return { cancelled: true };
+        }
+        result = await delegateHomeWorkItem(item, connection, true);
+    }
+    if (result?.ok) {
+        addLog("trace", "Sent a work item delegation request.", `Work item ${item.id}`);
+    }
+    return result;
+}
+
 async function loadHome() {
     if (!homeContent.querySelector(".home-loading-state")) {
         showLoading(
             homeContent,
             "Loading your Azure DevOps work",
-            "Fetching pull requests and work items.",
+            enabledFeatures.boards
+                ? "Fetching pull requests, favorite boards, and work items."
+                : "Fetching pull requests and work items.",
             { className: "home-loading-state" },
         );
     }
@@ -1101,7 +1771,9 @@ async function loadHome() {
             showNewBranchAction: !currentConfig.branch,
             onRetryBranch: refresh,
             onCreateBranch: requestNewSessionBranch,
+            onOpenBoard: enabledFeatures.boards ? openHomeBoard : null,
             onOpenPullRequest: openPullRequest,
+            onDelegateWorkItem: enabledFeatures.delegation ? delegateHomeWorkItem : null,
             onOpenWorkItem: openHomeWorkItem,
             onChooseProject: openConnectionPanel,
         });
@@ -1110,7 +1782,7 @@ async function loadHome() {
             "Loaded Azure DevOps home overview.",
             [
                 ...(data.connections || []).map((connection) =>
-                    `${[connection.organization, connection.project].filter(Boolean).join("/")}: ${connection.myPullRequests?.pullRequests?.length || 0} pull requests, ${connection.myWorkItems?.workItems?.length || 0} work items`),
+                    `${[connection.organization, connection.project].filter(Boolean).join("/")}: ${connection.myPullRequests?.pullRequests?.length || 0} pull requests, ${connection.myBoards?.boards?.length || 0} boards, ${connection.myWorkItems?.workItems?.length || 0} work items`),
                 branchMode
                     ? `${branchPullRequestInfo?.relatedWorkItems?.workItems?.length || 0} related work items`
                     : "",
@@ -1162,6 +1834,18 @@ function openPullRequest(id, connection) {
     return openEntry(entryForConnection("pull-request", id, connection || defaultEntryConnection()));
 }
 
+function openPullRequestRelation(relation, connection) {
+    return openEntry(entryForConnection(
+        "pull-request",
+        Number(relation.identifier),
+        connection || defaultEntryConnection(),
+        {
+            pullRequestProject: relation.projectId || "",
+            pullRequestRepositoryId: relation.repositoryId || "",
+        },
+    ));
+}
+
 // An organization-scope work item list spans projects, so the row carries the
 // project the item actually lives in; the connection alone does not know it.
 function openHomeWorkItem(workItem, connection) {
@@ -1173,6 +1857,13 @@ function openHomeWorkItem(workItem, connection) {
     ));
 }
 
+function openHomeBoard(board, connection) {
+    return openEntry({
+        ...entryForConnection("board", board.id, connection || defaultEntryConnection()),
+        name: board.name || "Board",
+    });
+}
+
 // A tab opened from somewhere other than a Home row - a link inside a pull
 // request, or the canvas's own pull request reference - belongs to the canvas's
 // primary connection.
@@ -1182,6 +1873,7 @@ function defaultEntryConnection() {
 
 function resetTabs() {
     for (const tab of tabs) {
+        releaseBoardTab(tab);
         if (tab.panel !== homePanel) {
             tab.panel.remove();
         }
@@ -1457,7 +2149,9 @@ async function refresh() {
         showLoading(
             homeContent,
             "Loading your Azure DevOps work",
-            "Fetching pull requests and work items.",
+            enabledFeatures.boards
+                ? "Fetching pull requests, favorite boards, and work items."
+                : "Fetching pull requests and work items.",
             { className: "home-loading-state" },
         );
         renderTabBar();
@@ -1546,6 +2240,34 @@ showLogsButton.addEventListener("click", () => {
     showLogsButton.textContent = logsPanel.hidden ? "show logs" : "hide logs";
     showLogsButton.setAttribute("aria-expanded", String(!logsPanel.hidden));
     if (!logsPanel.hidden) renderLogs();
+});
+async function updateFeatureFlags() {
+    enabledFeatures = normalizeFeatureFlags({
+        boards: boardsFeatureFlag?.checked,
+        delegation: delegationFeatureFlag?.checked,
+    });
+    const data = await request("/api/feature-flags", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(enabledFeatures),
+    });
+    enabledFeatures = normalizeFeatureFlags(data.featureFlags);
+    if (currentConfig) currentConfig.featureFlags = enabledFeatures;
+    homeLoaded = false;
+    await loadHome();
+    const tab = activeTab();
+    if (tab && tabEntry(tab)?.view === "work-item" && tab.data) {
+        renderWorkItemTab(tab);
+    }
+    if (boardWorkItemDrawerState?.data) {
+        renderBoardWorkItemDrawer();
+    }
+}
+boardsFeatureFlag?.addEventListener("change", () => {
+    updateFeatureFlags().catch((error) => addLog("error", "Failed to update preview features.", error.message || ""));
+});
+delegationFeatureFlag?.addEventListener("change", () => {
+    updateFeatureFlags().catch((error) => addLog("error", "Failed to update preview features.", error.message || ""));
 });
 copyLogsButton.addEventListener("click", async () => {
     try {

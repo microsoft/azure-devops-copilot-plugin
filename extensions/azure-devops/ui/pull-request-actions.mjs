@@ -4,7 +4,7 @@
 // mirror that sends the user to the browser to actually decide anything.
 
 import { createActionMenu } from "./action-menu.mjs";
-import { PULL_REQUEST_REVIEW_VOTING_ENABLED } from "./feature-flags.mjs";
+import { PULL_REQUEST_REVIEW_VOTING_ENABLED } from "../common.mjs";
 import { createSearchPicker } from "./search-picker.mjs";
 
 function element(tagName, className, text) {

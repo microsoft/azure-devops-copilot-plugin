@@ -270,15 +270,31 @@ export function looksLikeHtml(value) {
     return HTML_SOURCE.test(String(value ?? ""));
 }
 
+// Attachment images need the canvas server's bearer token, not a remote img request.
+let imageUrlTransform = null;
+
+export function setImageUrlTransform(transform) {
+    imageUrlTransform = typeof transform === "function" ? transform : null;
+}
+
+export function rewriteImageSources(root, transform = imageUrlTransform) {
+    if (!transform) return;
+    for (const image of root.querySelectorAll("img[src]")) {
+        const source = image.getAttribute("src");
+        const resolved = transform(source);
+        if (resolved && resolved !== source) image.setAttribute("src", resolved);
+    }
+}
+
 /**
  * Renders Azure DevOps rich text into `node`, replacing its current content.
  *
  * @param {Element} node target element
  * @param {string} value markdown or HTML source
- * @param {{ inline?: boolean, format?: "auto" | "markdown" | "html" }} options
+ * @param {{ inline?: boolean, format?: "auto" | "markdown" | "html", imageUrl?: (url: string) => string }} options
  * @returns {boolean} whether anything was rendered
  */
-export function renderRichText(node, value, { inline = false, format = "auto" } = {}) {
+export function renderRichText(node, value, { inline = false, format = "auto", imageUrl } = {}) {
     node.replaceChildren();
     const source = String(value ?? "").trim();
     if (!source) {
@@ -290,6 +306,7 @@ export function renderRichText(node, value, { inline = false, format = "auto" } 
     node.classList.remove("rich-text", "rich-text-inline");
     node.classList.add(inline ? "rich-text-inline" : "rich-text");
     node.append(sanitizeHtml(html));
+    rewriteImageSources(node, imageUrl);
     return Boolean(node.childNodes.length);
 }
 
@@ -299,7 +316,7 @@ export function renderRichText(node, value, { inline = false, format = "auto" } 
  * @param {string} tagName element to create
  * @param {string} className class applied to the element
  * @param {string} value markdown or HTML source
- * @param {{ inline?: boolean, format?: "auto" | "markdown" | "html" }} options
+ * @param {{ inline?: boolean, format?: "auto" | "markdown" | "html", imageUrl?: (url: string) => string }} options
  * @returns {Element}
  */
 export function richTextElement(tagName, className, value, options) {

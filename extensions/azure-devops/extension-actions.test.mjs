@@ -4,11 +4,20 @@ import test from "node:test";
 import { SourceTextModule, SyntheticModule, createContext } from "node:vm";
 
 const source = readFileSync(new URL("./extension.mjs", import.meta.url), "utf8");
+const hasPreviewFeatures = source.includes("\"./azdo-board.mjs\"");
 
-async function loadExtension() {
+async function loadExtension({ failBoardCleanup = false, failDelegationCleanup = false } = {}) {
     let declaration;
+    let delegationCloseAttempts = 0;
+    let lifecycle;
     let opened;
-    const context = createContext({});
+    let serverClosed = false;
+    const cleanupErrors = [];
+    const context = createContext({
+        console: {
+            error: (...args) => cleanupErrors.push(args.map(String).join(" ")),
+        },
+    });
     const session = {
         rpc: {
             canvas: {
@@ -37,7 +46,22 @@ async function loadExtension() {
             this.setExport("hasPullRequestReference", () => false);
             this.setExport("serializeCanvasInput", JSON.stringify);
             this.setExport("setCopilotSession", () => {});
-            this.setExport("startServer", async () => ({ input: {}, url: "http://127.0.0.1/" }));
+            this.setExport("startServer", async (_instanceId, _input, handlers) => {
+                lifecycle = handlers;
+                return {
+                    input: {},
+                    url: "http://127.0.0.1/",
+                    closeBoards: async () => {
+                        if (failBoardCleanup) throw new Error("board cleanup failed");
+                    },
+                    server: {
+                        close: (callback) => {
+                            serverClosed = true;
+                            callback();
+                        },
+                    },
+                };
+            });
         },
         { context },
     );
@@ -48,36 +72,77 @@ async function loadExtension() {
         },
         { context },
     );
+    const board = new SyntheticModule(
+        [
+            "azdoBoardActions",
+            "azdoBoardTools",
+            "closeAzdoBoard",
+            "delegateAzdoWorkItem",
+            "openAzdoBoard",
+            "setAzdoBoardSession",
+        ],
+        function initialize() {
+            this.setExport("azdoBoardActions", [{ name: "refresh_board" }]);
+            this.setExport("azdoBoardTools", []);
+            this.setExport("closeAzdoBoard", async () => {
+                delegationCloseAttempts += 1;
+                if (failDelegationCleanup) throw new Error("delegation cleanup failed");
+            });
+            this.setExport("delegateAzdoWorkItem", async () => ({}));
+            this.setExport("openAzdoBoard", async () => ({}));
+            this.setExport("setAzdoBoardSession", () => {});
+        },
+        { context },
+    );
     const module = new SourceTextModule(source, { context });
     await module.link((specifier) => {
         if (specifier === "@github/copilot-sdk/extension") return sdk;
+        if (specifier === "./azdo-board.mjs") return board;
         if (specifier === "./canvas-server.mjs") return server;
         if (specifier === "./work-item.mjs") return workItem;
         throw new Error(`Unexpected import: ${specifier}`);
     });
     await module.evaluate();
+    const canvasContext = {
+        extensionId: "test:azure-devops",
+        canvasId: "azure-devops",
+        instanceId: "ado-1",
+        input: {},
+    };
     return {
+        cleanupErrors,
         declaration,
+        delegate: async () => lifecycle.delegateWorkItem({
+            connection: { organization: "contoso", project: "project" },
+            dataProvider: {},
+            force: false,
+            item: { id: 123 },
+            mode: "local",
+        }),
+        delegationCloseAttempts: () => delegationCloseAttempts,
         invoke: async (name, input) => {
             opened = undefined;
             const action = declaration.actions.find((candidate) => candidate.name === name);
             assert.ok(action, `Missing action ${name}`);
             await action.handler({
-                extensionId: "test:azure-devops",
-                canvasId: "azure-devops",
-                instanceId: "ado-1",
+                ...canvasContext,
                 input,
             });
             return opened;
         },
+        open: async () => declaration.open(canvasContext),
+        close: async () => declaration.onClose(canvasContext),
+        serverClosed: () => serverClosed,
     };
 }
 
-test("only pull request and work item navigation actions are exposed", async () => {
+test("navigation and board actions are exposed", async () => {
     const { declaration } = await loadExtension();
     assert.deepEqual(
         Array.from(declaration.actions, (action) => action.name),
-        ["show_ado_pull_request", "show_ado_work_item"],
+        hasPreviewFeatures
+            ? ["show_ado_pull_request", "show_ado_work_item", "refresh_board"]
+            : ["show_ado_pull_request", "show_ado_work_item"],
     );
 });
 
@@ -114,4 +179,28 @@ test("navigation actions reopen the canvas from URLs or organization references"
             },
         },
     );
+});
+
+test("canvas cleanup closes the server after board and delegation failures", async () => {
+    const extension = await loadExtension({
+        failBoardCleanup: true,
+        failDelegationCleanup: true,
+    });
+    await extension.open();
+    if (hasPreviewFeatures) {
+        await extension.delegate();
+    }
+
+    await extension.close();
+
+    assert.equal(extension.serverClosed(), true);
+    if (hasPreviewFeatures) {
+        assert.equal(extension.delegationCloseAttempts(), 1);
+        assert.equal(extension.cleanupErrors.length, 2);
+        assert.ok(extension.cleanupErrors.some((message) => /board cleanup failed/.test(message)));
+        assert.ok(extension.cleanupErrors.some((message) => /delegation cleanup failed/.test(message)));
+    } else {
+        assert.equal(extension.delegationCloseAttempts(), 0);
+        assert.equal(extension.cleanupErrors.length, 0);
+    }
 });

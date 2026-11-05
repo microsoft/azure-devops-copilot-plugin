@@ -39,6 +39,21 @@
       </section>
       <div id="tabPanels"></div>
       <section id="connectionPanel" class="connection-overlay" hidden role="dialog" aria-modal="true" tabindex="-1" aria-label="Azure DevOps connection"></section>
+      <div id="workItemDrawerScrim" class="work-item-drawer-scrim" hidden></div>
+      <aside id="workItemDrawer" class="work-item-drawer" hidden role="dialog" aria-modal="true" aria-labelledby="workItemDrawerTitle" tabindex="-1">
+        <header class="work-item-drawer-bar">
+          <strong id="workItemDrawerTitle">Work item</strong>
+          <div class="work-item-drawer-controls">
+            <button id="workItemDrawerExpand" class="work-item-drawer-icon" type="button" aria-label="Open work item in a tab" title="Open in a tab">
+              <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M1.75 10a.75.75 0 0 1 .75.75v2.5c0 .138.112.25.25.25h2.5a.75.75 0 0 1 0 1.5h-2.5A1.75 1.75 0 0 1 1 13.25v-2.5a.75.75 0 0 1 .75-.75Zm12.5 0a.75.75 0 0 1 .75.75v2.5A1.75 1.75 0 0 1 13.25 15h-2.5a.75.75 0 0 1 0-1.5h2.5a.25.25 0 0 0 .25-.25v-2.5a.75.75 0 0 1 .75-.75ZM2.75 2.5a.25.25 0 0 0-.25.25v2.5a.75.75 0 0 1-1.5 0v-2.5C1 1.784 1.784 1 2.75 1h2.5a.75.75 0 0 1 0 1.5ZM10 1.75a.75.75 0 0 1 .75-.75h2.5c.966 0 1.75.784 1.75 1.75v2.5a.75.75 0 0 1-1.5 0v-2.5a.25.25 0 0 0-.25-.25h-2.5a.75.75 0 0 1-.75-.75Z"/></svg>
+            </button>
+            <button id="workItemDrawerClose" class="work-item-drawer-icon" type="button" aria-label="Close work item" title="Close">
+              <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.749.749 0 0 1 1.275.326.749.749 0 0 1-.215.734L9.06 8l3.22 3.22a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L8 9.06l-3.22 3.22a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z"/></svg>
+            </button>
+          </div>
+        </header>
+        <div id="workItemDrawerContent" class="work-item-drawer-content cards"></div>
+      </aside>
     </div>
   </main>
   <footer>
@@ -53,6 +68,7 @@
   </footer>
   <section id="logsPanel" class="logs-panel" hidden aria-label="Canvas logs">
     <div class="logs-header"><strong>Logs</strong><button id="copyLogsButton" class="secondary" type="button">Copy logs</button><span id="copyLogsStatus" class="status" aria-live="polite"></span></div>
+
     <div id="logsList" class="logs-list"></div>
   </section>
   <script type="module" src="/ui/app.mjs"></script>

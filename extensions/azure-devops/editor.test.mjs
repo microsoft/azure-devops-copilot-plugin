@@ -221,4 +221,7 @@ test("the edit affordance is icon-only but keeps an accessible name", needsDom, 
     const button = editButton("this work item", () => {});
     assert.equal(button.getAttribute("aria-label"), "Edit this work item");
     assert.equal(button.textContent.trim(), "", "the label is for assistive tech, not the eye");
+    assert.equal(button.querySelector("svg")?.getAttribute("data-icon-source"), "octicon");
+    assert.equal(button.querySelector("svg")?.getAttribute("data-icon-name"), "pencil");
+    assert.match(button.querySelector("path")?.getAttribute("d") || "", /^M11\.013 1\.427/);
 });
